@@ -534,12 +534,38 @@ static void YTKACEInstallMaximumRateHook(NSString *className,
     }
 }
 
+// Scanning every class of every non-system image is expensive and was done
+// synchronously in the constructor on every launch. The matching class names
+// only change with the app binary, so cache them per app version and build.
+static NSString *YTKACEMaximumRateCacheKey(void) {
+    NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+    NSString *version = info[@"CFBundleShortVersionString"] ?: @"unknown";
+    NSString *build = info[@"CFBundleVersion"] ?: @"unknown";
+    return [NSString stringWithFormat:@"YTKACEMaximumRateClasses.%@.%@",
+        version, build];
+}
+
+static NSArray<NSString *> *YTKACEMaximumRateClassNames(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSString *cacheKey = YTKACEMaximumRateCacheKey();
+    NSArray<NSString *> *cached = [defaults arrayForKey:cacheKey];
+    if (cached.count != 0) return cached;
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSString *name in YTKACEAppClassNames()) {
+        if ([name containsString:@"GranularVariableSpeedConfig"] ||
+            [name containsString:@"PlayerHotConfig"]) {
+            [names addObject:name];
+        }
+    }
+    // An empty result is not cached so the scan is retried next launch.
+    if (names.count != 0) [defaults setObject:names forKey:cacheKey];
+    return names;
+}
+
 static void YTKACEInstallMaximumRateHooks(void) {
     YTKACEMaximumRateOriginals = [NSMutableDictionary dictionary];
-    for (NSString *name in YTKACEAppClassNames()) {
-        BOOL candidate = [name containsString:@"GranularVariableSpeedConfig"] ||
-            [name containsString:@"PlayerHotConfig"];
-        if (!candidate) {
+    for (NSString *name in YTKACEMaximumRateClassNames()) {
+        if (![name isKindOfClass:NSString.class]) {
             continue;
         }
         Class cls = NSClassFromString(name);
