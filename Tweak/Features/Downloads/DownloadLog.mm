@@ -82,21 +82,92 @@ void YTKACEDebugLog(NSString *identifier, NSString *format, ...) {
     YTKACEWriteLogLine(identifier, message);
 }
 
+// Log state below is touched only on YTKACEDownloadLogQueue(). Lines are appended through a
+// long-lived file handle instead of re-reading and atomically rewriting the whole file per line.
+static NSFileHandle *YTKACEDownloadLogHandle = nil;
+static unsigned long long YTKACEDownloadLogSize = 0;
+
+static void YTKACECloseDownloadLogHandle(void) {
+    if (YTKACEDownloadLogHandle != nil) {
+        [YTKACEDownloadLogHandle closeAndReturnError:nil];
+        YTKACEDownloadLogHandle = nil;
+    }
+    YTKACEDownloadLogSize = 0;
+}
+
+static BOOL YTKACEOpenDownloadLogHandle(void) {
+    if (YTKACEDownloadLogHandle != nil) return YES;
+    NSURL *URL = YTKACEDownloadLogURL();
+    if (![NSFileManager.defaultManager fileExistsAtPath:URL.path] &&
+        ![NSFileManager.defaultManager createFileAtPath:URL.path contents:nil attributes:nil]) {
+        return NO;
+    }
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingToURL:URL error:nil];
+    if (handle == nil) return NO;
+    unsigned long long offset = 0;
+    if (![handle seekToEndReturningOffset:&offset error:nil]) {
+        [handle closeAndReturnError:nil];
+        return NO;
+    }
+    YTKACEDownloadLogHandle = handle;
+    YTKACEDownloadLogSize = offset;
+    return YES;
+}
+
+// Keeps roughly the newest half of the log, starting at a line boundary.
+static void YTKACERotateDownloadLog(void) {
+    YTKACECloseDownloadLogHandle();
+    NSURL *URL = YTKACEDownloadLogURL();
+    NSData *data = [NSData dataWithContentsOfURL:URL options:NSDataReadingMappedIfSafe error:nil];
+    NSData *tail = NSData.data;
+    NSUInteger keep = YTKACEDownloadLogLimit / 2;
+    if (data.length > keep) {
+        NSUInteger start = data.length - keep;
+        NSRange newline = [data rangeOfData:[NSData dataWithBytes:"\n" length:1]
+                                    options:0
+                                      range:NSMakeRange(start, data.length - start)];
+        if (newline.location != NSNotFound) start = NSMaxRange(newline);
+        tail = [data subdataWithRange:NSMakeRange(start, data.length - start)];
+    } else if (data != nil) {
+        tail = data;
+    }
+    [tail writeToURL:URL atomically:YES];
+}
+
+static NSString *YTKACEDownloadLogTimestamp(NSDate *date) {
+    // Same text as -[NSDate description] ("yyyy-MM-dd HH:mm:ss +0000"), without a formatter per line.
+    static NSDateFormatter *formatter;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        formatter = [NSDateFormatter new];
+        formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        formatter.calendar = [NSCalendar calendarWithIdentifier:NSCalendarIdentifierGregorian];
+        formatter.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+        formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss Z";
+    });
+    return [formatter stringFromDate:date];
+}
+
 static void YTKACEWriteLogLine(NSString *identifier, NSString *message) {
-    if (message.length > 4096) message = [message substringToIndex:4096];
-    NSString *line = [NSString stringWithFormat:@"%@ [%@] %@\n",
-        NSDate.date, identifier.length == 0 ? @"download" : identifier, message];
+    if (message.length > 4096) {
+        // Cut on a composed-character boundary so a split surrogate pair cannot make the UTF-8
+        // conversion below fail.
+        message = [message substringToIndex:
+            [message rangeOfComposedCharacterSequenceAtIndex:4096].location];
+    }
+    NSDate *date = NSDate.date;
+    NSString *tag = identifier.length == 0 ? @"download" : [identifier copy];
     dispatch_async(YTKACEDownloadLogQueue(), ^{
-        NSURL *URL = YTKACEDownloadLogURL();
-        NSData *existing = [NSData dataWithContentsOfURL:URL] ?: NSData.data;
-        NSMutableData *data = [existing mutableCopy];
-        [data appendData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        if (data.length > YTKACEDownloadLogLimit) {
-            NSUInteger keep = YTKACEDownloadLogLimit * 3 / 4;
-            NSData *tail = [data subdataWithRange:NSMakeRange(data.length - keep, keep)];
-            data = [tail mutableCopy];
+        NSString *line = [NSString stringWithFormat:@"%@ [%@] %@\n",
+            YTKACEDownloadLogTimestamp(date), tag, message];
+        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding allowLossyConversion:YES];
+        if (data.length == 0 || !YTKACEOpenDownloadLogHandle()) return;
+        if (![YTKACEDownloadLogHandle writeData:data error:nil]) {
+            YTKACECloseDownloadLogHandle();
+            return;
         }
-        [data writeToURL:URL atomically:YES];
+        YTKACEDownloadLogSize += data.length;
+        if (YTKACEDownloadLogSize > YTKACEDownloadLogLimit) YTKACERotateDownloadLog();
     });
 }
 
@@ -111,7 +182,10 @@ NSString *YTKACEDownloadLogContents(void) {
 }
 
 void YTKACEClearDownloadLog(void) {
-    dispatch_sync(YTKACEDownloadLogQueue(), ^{
+    // Async: called from the launch constructor on the main thread. The queue is serial, so a
+    // later YTKACEDownloadLogContents() still observes the cleared log.
+    dispatch_async(YTKACEDownloadLogQueue(), ^{
+        YTKACECloseDownloadLogHandle();
         [NSFileManager.defaultManager removeItemAtURL:YTKACEDownloadLogURL() error:nil];
     });
 }

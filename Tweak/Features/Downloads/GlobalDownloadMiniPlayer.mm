@@ -113,25 +113,71 @@ static BOOL YTKACEGlobalFullPlayerVisible(void) {
     return NO;
 }
 
+static BOOL YTKACEGlobalTabCandidate(UIView *view, UIWindow *window, CGFloat *minY) {
+    NSString *name = NSStringFromClass(view.class).lowercaseString;
+    BOOL tab = [view isKindOfClass:UITabBar.class] ||
+        [name containsString:@"pivotbar"];
+    if (!tab || CGRectGetHeight(view.bounds) < 35.0) return NO;
+    CGRect frame = [view convertRect:view.bounds toView:window];
+    if (CGRectGetMinY(frame) <= CGRectGetHeight(window.bounds) * 0.55) return NO;
+    *minY = CGRectGetMinY(frame);
+    return YES;
+}
+
+static BOOL YTKACEGlobalViewVisibleInWindow(UIView *view, UIWindow *window) {
+    for (UIView *current = view; current != nil; current = current.superview) {
+        if (current.hidden || current.alpha < 0.05) return NO;
+        if (current == window) return YES;
+    }
+    return NO;
+}
+
+// The mini player's position timer asks for this every 0.35 s. Walking YouTube's whole view
+// tree each time is expensive, so remember the tab bar views found by the last full walk and
+// reuse them while they are all still visible in the same window; otherwise walk again (at most
+// once per second while no tab bar is on screen).
 static CGFloat YTKACEGlobalTabTop(UIWindow *window) {
-    __block CGFloat top = CGRectGetHeight(window.bounds) -
-        window.safeAreaInsets.bottom;
+    static __weak UIWindow *cachedWindow;
+    static CGRect cachedBounds;
+    static NSHashTable<UIView *> *cachedViews;
+    static CFTimeInterval lastWalk;
+    CGFloat top = CGRectGetHeight(window.bounds) - window.safeAreaInsets.bottom;
+    CFTimeInterval now = CACurrentMediaTime();
+    BOOL sameWindow = window == cachedWindow &&
+        CGRectEqualToRect(window.bounds, cachedBounds) && cachedViews != nil;
+    if (sameWindow) {
+        NSArray<UIView *> *views = cachedViews.allObjects;
+        if (views.count == 0 && now - lastWalk < 1.0) return top;
+        BOOL valid = views.count != 0;
+        CGFloat cachedTop = top;
+        for (UIView *view in views) {
+            CGFloat minY = 0.0;
+            if (!YTKACEGlobalViewVisibleInWindow(view, window) ||
+                !YTKACEGlobalTabCandidate(view, window, &minY)) {
+                valid = NO;
+                break;
+            }
+            cachedTop = MIN(cachedTop, minY);
+        }
+        if (valid) return cachedTop;
+    }
+    NSHashTable<UIView *> *found = [NSHashTable weakObjectsHashTable];
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:window];
     while (stack.count != 0) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
         if (view.hidden || view.alpha < 0.05) continue;
-        NSString *name = NSStringFromClass(view.class).lowercaseString;
-        BOOL tab = [view isKindOfClass:UITabBar.class] ||
-            [name containsString:@"pivotbar"];
-        if (tab && CGRectGetHeight(view.bounds) >= 35.0) {
-            CGRect frame = [view convertRect:view.bounds toView:window];
-            if (CGRectGetMinY(frame) > CGRectGetHeight(window.bounds) * 0.55) {
-                top = MIN(top, CGRectGetMinY(frame));
-            }
+        CGFloat minY = 0.0;
+        if (YTKACEGlobalTabCandidate(view, window, &minY)) {
+            top = MIN(top, minY);
+            [found addObject:view];
         }
         [stack addObjectsFromArray:view.subviews];
     }
+    cachedWindow = window;
+    cachedBounds = window.bounds;
+    cachedViews = found;
+    lastWalk = now;
     return top;
 }
 
@@ -169,6 +215,7 @@ static UIButton *YTKACEMiniButton(NSString *symbol, CGFloat size, id target, SEL
 @property(nonatomic, assign) CGFloat pinchStartSize;
 @property(nonatomic, assign) NSInteger corner;
 @property(nonatomic, assign) CGPoint panStartCenter;
+@property(nonatomic, copy) NSURL *artworkURL;
 @end
 
 @implementation YTKACEGlobalDownloadMiniPlayer
@@ -528,6 +575,8 @@ static UIButton *YTKACEMiniButton(NSString *symbol, CGFloat size, id target, SEL
         YTKACEDownloadPlaybackSession.sharedSession;
     NSURL *URL = session.currentURL;
     if (URL == nil) {
+        self.artworkURL = nil;
+        self.artworkView.image = nil;
         [self.card removeFromSuperview];
         [self.positionTimer invalidate];
         self.positionTimer = nil;
@@ -543,7 +592,15 @@ static UIButton *YTKACEMiniButton(NSString *symbol, CGFloat size, id target, SEL
     [window bringSubviewToFront:self.card];
     self.audio = [URL.path containsString:@"/Downloads/Audio/"];
     self.artworkView.hidden = !self.audio;
-    self.artworkView.image = self.audio ? YTKACEMediaArtworkImage(URL) : nil;
+    // refresh runs on every playback notification; only look the artwork up again when the
+    // track changes (or none was found yet, e.g. while the sidecar is still being written).
+    if (!self.audio) {
+        self.artworkView.image = nil;
+        self.artworkURL = nil;
+    } else if (![URL isEqual:self.artworkURL] || self.artworkView.image == nil) {
+        self.artworkURL = URL;
+        self.artworkView.image = YTKACEMediaArtworkImage(URL);
+    }
     UIImageSymbolConfiguration *configuration =
         [UIImageSymbolConfiguration configurationWithPointSize:15.0
                                                         weight:UIImageSymbolWeightBold];

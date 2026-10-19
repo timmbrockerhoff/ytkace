@@ -5,6 +5,7 @@
 #import "DownloadLog.h"
 
 #import <UIKit/UIKit.h>
+#import <ImageIO/ImageIO.h>
 #import <math.h>
 
 @interface YTKACEDownloadProgressItem : NSObject
@@ -250,15 +251,18 @@ NSNotificationName const YTKACEDownloadJobsDidChangeNotification = @"YTKACEDownl
         [window addSubview:self.card];
     }
     [window bringSubviewToFront:self.card];
-    [self applyTheme];
+    // renderItem (the only caller) applies the theme right after this, so it is not repeated here.
     [self layoutCard];
-    [self.positionTimer invalidate];
-    __weak YTKACEDownloadProgressView *weakSelf = self;
-    self.positionTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES
-        block:^(NSTimer *timer) {
-            (void)timer;
-            [weakSelf layoutCard];
-        }];
+    if (!self.positionTimer.isValid) {
+        // Created once while the card is shown instead of being torn down and rescheduled on
+        // every progress update.
+        __weak YTKACEDownloadProgressView *weakSelf = self;
+        self.positionTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES
+            block:^(NSTimer *timer) {
+                (void)timer;
+                [weakSelf layoutCard];
+            }];
+    }
     if (self.card.alpha < 1.0 && !self.dragging) {
         self.card.transform = CGAffineTransformMakeTranslation(0.0, 18.0);
         [UIView animateWithDuration:0.32 delay:0.0
@@ -308,7 +312,7 @@ NSNotificationName const YTKACEDownloadJobsDidChangeNotification = @"YTKACEDownl
     NSMutableArray<NSString *> *details = [NSMutableArray array];
     if (detail.length != 0) [details addObject:detail];
     if (summary.length != 0) [details addObject:summary];
-    [details insertObject:stageText atIndex:0];
+    [details insertObject:stageText ?: @"" atIndex:0];
     self.statusLabel.text = [details componentsJoinedByString:@" · "];
     self.retryButton.hidden = !item.failed || self.retryHandler == nil;
     self.percentLabel.hidden = item.failed;
@@ -420,6 +424,29 @@ NSNotificationName const YTKACEDownloadJobsDidChangeNotification = @"YTKACEDownl
     self.retryHandler(identifier);
 }
 
+static UIImage *YTKACEDownsampledThumbnail(NSData *data, NSUInteger maxPixelSize) {
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    if (source == NULL) return nil;
+    NSUInteger limit = maxPixelSize;
+    NSDictionary *properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, NULL));
+    NSUInteger width = [properties[(id)kCGImagePropertyPixelWidth] unsignedIntegerValue];
+    NSUInteger height = [properties[(id)kCGImagePropertyPixelHeight] unsignedIntegerValue];
+    if (width != 0 && height != 0) limit = MIN(limit, MAX(width, height));
+    NSDictionary *options = @{
+        (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+        (id)kCGImageSourceCreateThumbnailWithTransform: @YES,
+        (id)kCGImageSourceShouldCacheImmediately: @YES,
+        (id)kCGImageSourceThumbnailMaxPixelSize: @(MAX(limit, (NSUInteger)1))
+    };
+    CGImageRef image = CGImageSourceCreateThumbnailAtIndex(source, 0,
+        (__bridge CFDictionaryRef)options);
+    CFRelease(source);
+    if (image == NULL) return nil;
+    UIImage *result = [UIImage imageWithCGImage:image];
+    CGImageRelease(image);
+    return result;
+}
+
 - (void)loadThumbnailForItem:(YTKACEDownloadProgressItem *)item {
     if (item.thumbnailURL == nil) return;
     NSString *identifier = item.identifier;
@@ -428,7 +455,10 @@ NSNotificationName const YTKACEDownloadJobsDidChangeNotification = @"YTKACEDownl
             NSURLResponse *response, NSError *error) {
         (void)response;
         if (error != nil || data.length == 0) return;
-        UIImage *image = [UIImage imageWithData:data];
+        // Shown at 85x48 pt here and 142x80 pt in the library's job rows; decode a downsampled
+        // bitmap off the main thread instead of keeping the full-size thumbnail.
+        UIImage *image = YTKACEDownsampledThumbnail(data, 480);
+        if (image == nil) image = [UIImage imageWithData:data];
         if (image == nil) return;
         dispatch_async(dispatch_get_main_queue(), ^{
             YTKACEDownloadProgressItem *current = self.items[identifier];
@@ -450,6 +480,7 @@ NSNotificationName const YTKACEDownloadJobsDidChangeNotification = @"YTKACEDownl
 - (void)beginJob:(NSString *)identifier
            title:(NSString *)title
     thumbnailURL:(NSURL *)thumbnailURL {
+    if (identifier.length == 0) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         YTKACEDownloadProgressItem *item = [YTKACEDownloadProgressItem new];
         item.identifier = identifier;

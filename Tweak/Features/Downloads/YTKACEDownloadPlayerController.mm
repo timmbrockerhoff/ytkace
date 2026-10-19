@@ -327,6 +327,40 @@ CGFloat YTKACEDownloadProgressRatio(NSURL *URL) {
     return (CGFloat)MAX(0.0, MIN(1.0, ratio));
 }
 
+// Read-only variant for the library list: takes a resume table the caller read once per reload
+// and never writes back to NSUserDefaults (YTKACEDownloadProgressRatio normalizes and may write).
+// Declared in YTKACEDownloadsController.mm.
+FOUNDATION_EXPORT CGFloat YTKACEDownloadProgressRatioInTable(NSURL *URL,
+                                                             NSDictionary *table);
+CGFloat YTKACEDownloadProgressRatioInTable(NSURL *URL, NSDictionary *table) {
+    if (URL == nil || ![table isKindOfClass:NSDictionary.class]) return 0.0;
+    id value = table[YTKACEResumeIdentifier(URL)];
+    if (value == nil) {
+        NSString *legacyIdentifier = YTKACELegacyResumeIdentifier(URL);
+        if (legacyIdentifier.length != 0) value = table[legacyIdentifier];
+    }
+    if (![value isKindOfClass:NSDictionary.class]) return 0.0;
+    NSDictionary *record = (NSDictionary *)value;
+    id positionValue = record[@"t"];
+    id durationValue = record[@"d"];
+    if (![positionValue respondsToSelector:@selector(doubleValue)] ||
+        ![durationValue respondsToSelector:@selector(doubleValue)]) {
+        return 0.0;
+    }
+    double position = [positionValue doubleValue];
+    double duration = [durationValue doubleValue];
+    BOOL completed = [record[@"c"] respondsToSelector:@selector(boolValue)] &&
+        [record[@"c"] boolValue];
+    BOOL valid = isfinite(position) && isfinite(duration) &&
+        duration > 0.0 && position >= 0.0 && position <= duration &&
+        (completed || position > 0.0);
+    if (!valid) return 0.0;
+    if (completed) return 1.0;
+    double ratio = position / duration;
+    if (!isfinite(ratio)) return 0.0;
+    return (CGFloat)MAX(0.0, MIN(1.0, ratio));
+}
+
 static void YTKACEStoreResume(NSURL *URL, NSTimeInterval seconds,
                               NSTimeInterval duration, BOOL completed) {
     if (URL == nil) return;
@@ -682,7 +716,7 @@ static void YTKACEStoreCompleted(NSURL *URL, NSTimeInterval duration,
     if (self.playlist.count == 0 || self.currentIndex == NSNotFound) {
         return;
     }
-    NSInteger previous = self.currentIndex - 1;
+    NSInteger previous = MIN(self.currentIndex, (NSInteger)self.playlist.count) - 1;
     if (previous < 0) {
         previous = self.autoplayEnabled ? (NSInteger)self.playlist.count - 1 : NSNotFound;
     }
@@ -745,7 +779,9 @@ static void YTKACEStoreCompleted(NSURL *URL, NSTimeInterval duration,
     if (isfinite(duration) && duration > 0.0) info[MPMediaItemPropertyPlaybackDuration] = @(duration);
     if (isfinite(elapsed) && elapsed >= 0.0) info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @(elapsed);
     info[MPNowPlayingInfoPropertyPlaybackRate] = @(self.player.rate);
-    UIImage *image = YTKACEMediaArtworkImage(self.currentURL);
+    // Cached and downsampled (600 px is plenty for lock screen / Control Center); this runs on
+    // every play, pause, seek and rate change.
+    UIImage *image = YTKACEMediaArtworkImageWithMaxPixelSize(self.currentURL, 600.0);
     if (image != nil) {
         MPMediaItemArtwork *artwork = [[MPMediaItemArtwork alloc]
             initWithBoundsSize:image.size requestHandler:^UIImage *(CGSize size) {
@@ -1747,7 +1783,11 @@ static UIImage *YTKACEScrubberThumb(CGFloat diameter, UIColor *color) {
 }
 
 - (void)downloadInfoChanged:(NSNotification *)notification {
-    (void)notification;
+    NSURL *URL = notification.object;
+    if ([URL isKindOfClass:NSURL.class] && self.session.currentURL != nil &&
+        ![URL.path isEqualToString:self.session.currentURL.path]) {
+        return;
+    }
     self.channelMediaPath = nil;
     [self refreshControls];
 }
