@@ -25,6 +25,26 @@
 static NSString *const YTKACEDownloadLibraryChanged =
     @"YTKACEDownloadLibraryChanged";
 
+// Same key the playback session stores resume positions under (YTKACEDownloadPlayerController.mm).
+static NSString *const YTKACEResumePositionsKey =
+    @"YTKACE.Preference.Downloads.ResumePositions";
+
+// Defined in YTKACEDownloadPlayerController.mm: watched ratio for URL from an already-read resume
+// table, without writing anything back to NSUserDefaults.
+FOUNDATION_EXPORT CGFloat YTKACEDownloadProgressRatioInTable(NSURL *URL, NSDictionary *table);
+
+// Long side, in pixels, an image of `source` pixels must be decoded at so it still covers
+// `target` pixels when shown aspect-fill. Capped at 1280 (the size thumbnails used to be decoded
+// at). Returns 0 when the source size is unknown.
+static CGFloat YTKACECoverPixelSize(CGSize source, CGSize target) {
+    CGFloat width = fabs(source.width);
+    CGFloat height = fabs(source.height);
+    if (!isfinite(width) || !isfinite(height) || width <= 0.0 || height <= 0.0) return 0.0;
+    if (!(target.width > 0.0) || !(target.height > 0.0)) return 1280.0;
+    CGFloat scale = MIN(1.0, MAX(target.width / width, target.height / height));
+    return MIN(1280.0, MAX(1.0, ceil(MAX(width, height) * scale)));
+}
+
 static NSArray<NSURL *> *YTKACESidecarURLs(NSURL *URL) {
     NSURL *base = URL.URLByDeletingPathExtension;
     return @[
@@ -513,6 +533,13 @@ static void YTKACESaveVideoToPhotos(NSURL *url) {
 @property(nonatomic, strong) UILabel *miniTitleLabel;
 @property(nonatomic, strong) UILabel *miniSubtitleLabel;
 @property(nonatomic, strong) UIButton *miniPlayButton;
+// Per-reload / per-file memos so cell configuration stays cheap on the main thread.
+@property(nonatomic, copy) NSDictionary *resumeTable;
+@property(nonatomic, strong) NSCache<NSString *, id> *channelCache;
+@property(nonatomic, strong) NSMutableSet<NSString *> *artworkProbed;
+@property(nonatomic, strong) NSMutableSet<NSString *> *pendingInfoPaths;
+@property(nonatomic, assign) BOOL pendingInfoFullReload;
+@property(nonatomic, assign) BOOL infoReloadScheduled;
 @end
 
 static NSString *YTKACECategoryKey(NSInteger segment) {
@@ -557,6 +584,12 @@ static void YTKACEStoreMode(NSString *field, NSInteger segment, NSInteger mode) 
     self.view.accessibilityIdentifier = @"YTKACEDownloadsRoot";
     self.title = YTKACELocalized(@"Downloads");
     self.metadataCache = [NSCache new];
+    // Entries are costed by decoded bitmap size (see loadMetadataForURL:).
+    self.metadataCache.totalCostLimit = 50 * 1024 * 1024;
+    self.channelCache = [NSCache new];
+    self.channelCache.countLimit = 1000;
+    self.artworkProbed = [NSMutableSet set];
+    self.pendingInfoPaths = [NSMutableSet set];
     self.metadataQueue = [NSOperationQueue new];
     self.metadataQueue.maxConcurrentOperationCount = 3;
     self.metadataQueue.qualityOfService = NSQualityOfServiceUserInitiated;
@@ -683,7 +716,7 @@ static void YTKACEStoreMode(NSString *field, NSInteger segment, NSInteger mode) 
         self.emptyLabel.hidden = self.files.count != 0 || self.jobs.count != 0;
         self.collectionView.hidden = self.files.count == 0 && self.jobs.count == 0;
         [self.collectionView.collectionViewLayout invalidateLayout];
-        [self.collectionView reloadData];
+        [self reloadCollection];
         return;
     }
     for (UICollectionReusableView *view in
@@ -712,9 +745,77 @@ referenceSizeForHeaderInSection:(NSInteger)section {
     return CGSizeMake(CGRectGetWidth(collectionView.bounds), 36.0 + 92.0 * self.jobs.count);
 }
 
-- (void)downloadInfoChanged:(NSNotification *)notification {
-    (void)notification;
+- (void)reloadCollection {
+    // The resume table is read lazily once per reload instead of once per cell.
+    self.resumeTable = nil;
     [self.collectionView reloadData];
+}
+
+- (CGFloat)watchedRatioForURL:(NSURL *)url {
+    if (self.resumeTable == nil) {
+        self.resumeTable = [NSUserDefaults.standardUserDefaults
+            dictionaryForKey:YTKACEResumePositionsKey] ?: @{};
+    }
+    return YTKACEDownloadProgressRatioInTable(url, self.resumeTable);
+}
+
+- (NSString *)channelNameForPath:(NSString *)path {
+    id channel = [self.channelCache objectForKey:path];
+    if (channel == nil) {
+        channel = YTKACEStoredChannelName([NSURL fileURLWithPath:path]) ?: (id)NSNull.null;
+        [self.channelCache setObject:channel forKey:path];
+    }
+    return [channel isKindOfClass:NSString.class] ? channel : nil;
+}
+
+// SponsorBlock / channel records are written per file (often twice per download), each posting
+// this notification. Coalesce bursts and refresh only the affected items instead of reloading the
+// whole collection every time.
+- (void)downloadInfoChanged:(NSNotification *)notification {
+    NSURL *URL = notification.object;
+    if ([URL isKindOfClass:NSURL.class] && URL.path.length != 0) {
+        [self.pendingInfoPaths addObject:URL.path.stringByStandardizingPath];
+    } else {
+        self.pendingInfoFullReload = YES;
+    }
+    if (self.infoReloadScheduled) return;
+    self.infoReloadScheduled = YES;
+    __weak __typeof__(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf flushInfoChanges];
+    });
+}
+
+- (void)flushInfoChanges {
+    self.infoReloadScheduled = NO;
+    NSSet<NSString *> *paths = [self.pendingInfoPaths copy];
+    BOOL full = self.pendingInfoFullReload;
+    [self.pendingInfoPaths removeAllObjects];
+    self.pendingInfoFullReload = NO;
+    if (full) {
+        [self.channelCache removeAllObjects];
+        [self.artworkProbed removeAllObjects];
+    }
+    if (!self.isViewLoaded) return;
+    NSMutableArray<NSIndexPath *> *indexPaths = [NSMutableArray array];
+    NSArray<NSURL *> *files = self.files;
+    for (NSUInteger index = 0; index < files.count; index++) {
+        NSString *path = files[index].path;
+        if (path.length == 0 ||
+            ![paths containsObject:path.stringByStandardizingPath]) {
+            continue;
+        }
+        [self.channelCache removeObjectForKey:path];
+        [self.artworkProbed removeObject:path];
+        [indexPaths addObject:[NSIndexPath indexPathForItem:(NSInteger)index inSection:0]];
+    }
+    if (full || [self.collectionView numberOfItemsInSection:0] != (NSInteger)files.count) {
+        [self reloadCollection];
+        return;
+    }
+    if (indexPaths.count == 0) return;
+    [self.collectionView reconfigureItemsAtIndexPaths:indexPaths];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -736,7 +837,7 @@ referenceSizeForHeaderInSection:(NSInteger)section {
     if (previousTraitCollection == nil ||
         [self.traitCollection hasDifferentColorAppearanceComparedToTraitCollection:previousTraitCollection]) {
         [self applyTheme];
-        [self.collectionView reloadData];
+        [self reloadCollection];
     }
 }
 
@@ -820,11 +921,14 @@ referenceSizeForHeaderInSection:(NSInteger)section {
 
 - (void)downloadPlaybackChanged:(NSNotification *)notification {
     (void)notification;
+    // Playback may have stored a new resume position; re-read it on the next cell configure.
+    self.resumeTable = nil;
     [self updateMiniPlayer];
 }
 
 - (void)downloadPlaybackStopped:(NSNotification *)notification {
     (void)notification;
+    self.resumeTable = nil;
     [self updateMiniPlayer];
 }
 
@@ -964,7 +1068,9 @@ referenceSizeForHeaderInSection:(NSInteger)section {
         }];
     self.emptyLabel.hidden = self.files.count != 0 || self.jobs.count != 0;
     self.collectionView.hidden = self.files.count == 0 && self.jobs.count == 0;
-    [self.collectionView reloadData];
+    [self.channelCache removeAllObjects];
+    [self.artworkProbed removeAllObjects];
+    [self reloadCollection];
 }
 
 - (void)segmentChanged {
@@ -1051,7 +1157,7 @@ referenceSizeForHeaderInSection:(NSInteger)section {
                         strongSelf.segmentedControl.selectedSegmentIndex,
                         capturedIndex);
                     [strongSelf.collectionView.collectionViewLayout invalidateLayout];
-                    [strongSelf.collectionView reloadData];
+                    [strongSelf reloadCollection];
                 } else {
                     strongSelf.sortMode = capturedIndex - 3;
                     YTKACEStoreMode(@"Sort",
@@ -1091,7 +1197,7 @@ referenceSizeForHeaderInSection:(NSInteger)section {
                     strongSelf.segmentedControl.selectedSegmentIndex, mode);
                 [strongSelf updateLibraryMenu];
                 [strongSelf.collectionView.collectionViewLayout invalidateLayout];
-                [strongSelf.collectionView reloadData];
+                [strongSelf reloadCollection];
             }];
         action.state = self.layoutMode == mode
             ? UIMenuElementStateOn : UIMenuElementStateOff;
@@ -1144,7 +1250,7 @@ referenceSizeForHeaderInSection:(NSInteger)section {
                     self.layoutMode);
     [self applyLayoutButtonImage];
     [self.collectionView.collectionViewLayout invalidateLayout];
-    [self.collectionView reloadData];
+    [self reloadCollection];
 }
 
 - (NSInteger)collectionView:(UICollectionView *)collectionView
@@ -1202,7 +1308,7 @@ minimumInteritemSpacingForSectionAtIndex:(NSInteger)section {
     [url getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
     cell.layoutMode = self.layoutMode;
     cell.representedPath = url.path;
-    cell.watchedRatio = YTKACEDownloadProgressRatio(url);
+    cell.watchedRatio = [self watchedRatioForURL:url];
     cell.nameLabel.text = url.lastPathComponent.stringByDeletingPathExtension;
     cell.metadataLabel.text = [NSByteCountFormatter stringFromByteCount:size.longLongValue
                                                               countStyle:NSByteCountFormatterCountStyleFile];
@@ -1232,13 +1338,19 @@ minimumInteritemSpacingForSectionAtIndex:(NSInteger)section {
     return cell;
 }
 
-static UIImage *YTKACEDecodedThumbnail(CGImageSourceRef source) {
+static UIImage *YTKACEDecodedThumbnail(CGImageSourceRef source, CGSize target) {
     if (source == NULL) return nil;
+    NSDictionary *properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, NULL));
+    CGSize pixels = CGSizeMake([properties[(id)kCGImagePropertyPixelWidth] doubleValue],
+                               [properties[(id)kCGImagePropertyPixelHeight] doubleValue]);
+    NSInteger orientation = [properties[(id)kCGImagePropertyOrientation] integerValue];
+    if (orientation >= 5 && orientation <= 8) pixels = CGSizeMake(pixels.height, pixels.width);
+    CGFloat maxPixelSize = YTKACECoverPixelSize(pixels, target);
     NSDictionary *options = @{
         (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
         (id)kCGImageSourceCreateThumbnailWithTransform: @YES,
         (id)kCGImageSourceShouldCacheImmediately: @YES,
-        (id)kCGImageSourceThumbnailMaxPixelSize: @1280
+        (id)kCGImageSourceThumbnailMaxPixelSize: @(maxPixelSize > 0.0 ? maxPixelSize : 1280.0)
     };
     CGImageRef image = CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)options);
     if (image == NULL) return nil;
@@ -1247,12 +1359,70 @@ static UIImage *YTKACEDecodedThumbnail(CGImageSourceRef source) {
     return result;
 }
 
+// Video frame or artwork for url, decoded just large enough to cover `target` pixels.
+static UIImage *YTKACELibraryThumbnail(NSURL *url, AVURLAsset *asset, AVAssetTrack *track,
+                                       NSTimeInterval duration, CGSize dimensions,
+                                       CGSize target, BOOL *foundArtwork) {
+    UIImage *thumbnail = nil;
+    NSData *artwork = YTKACEMediaArtworkData(url);
+    if (foundArtwork != NULL) *foundArtwork = artwork.length != 0;
+    if (artwork.length != 0) {
+        CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)artwork, NULL);
+        thumbnail = YTKACEDecodedThumbnail(source, target);
+        if (source != NULL) CFRelease(source);
+    }
+    if (thumbnail == nil && track != nil) {
+        AVAssetImageGenerator *generator =
+            [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
+        generator.appliesPreferredTrackTransform = YES;
+        CGFloat side = YTKACECoverPixelSize(dimensions, target);
+        generator.maximumSize = side > 0.0 ? CGSizeMake(side, side) : CGSizeMake(1280.0, 720.0);
+        CGImageRef image = [generator copyCGImageAtTime:
+            CMTimeMakeWithSeconds(duration > 2.0 ? 1.0 : 0.0, 600)
+                                                actualTime:NULL error:nil];
+        if (image != NULL) {
+            thumbnail = [UIImage imageWithCGImage:image];
+            CGImageRelease(image);
+        }
+    }
+    return thumbnail;
+}
+
+// Pixel size of the thumbnail view for the current layout (mirrors the cell / item geometry).
+- (CGSize)thumbnailPixelSize {
+    CGFloat width = CGRectGetWidth(self.collectionView.bounds);
+    if (width <= 0.0) width = CGRectGetWidth(self.view.bounds);
+    if (width <= 0.0) width = CGRectGetWidth(UIScreen.mainScreen.bounds);
+    CGSize points;
+    if (self.layoutMode == 0) {
+        CGFloat cardWidth = MIN(720.0, width - 24.0);
+        points = CGSizeMake(cardWidth, round(cardWidth * 9.0 / 16.0));
+    } else if (self.layoutMode == 1) {
+        CGFloat cardHeight = 92.0 - 12.0;
+        points = CGSizeMake(round(cardHeight * 16.0 / 9.0), cardHeight);
+    } else {
+        NSInteger columns = width >= 700.0 ? 3 : 2;
+        CGFloat itemWidth = floor((width - 12.0 - 6.0 * (columns - 1)) / columns);
+        CGFloat cardWidth = itemWidth - 6.0;
+        points = CGSizeMake(cardWidth, round(cardWidth * 9.0 / 16.0));
+    }
+    CGFloat scale = self.traitCollection.displayScale;
+    if (!(scale > 0.0)) scale = UIScreen.mainScreen.scale;
+    return CGSizeMake(ceil(MAX(1.0, points.width) * scale),
+                      ceil(MAX(1.0, points.height) * scale));
+}
+
 - (void)loadMetadataForURL:(NSURL *)url
                        cell:(YTKACEDownloadCell *)cell
                        size:(long long)size {
     NSString *path = url.path;
+    CGSize target = [self thumbnailPixelSize];
     NSDictionary *cached = [self.metadataCache objectForKey:path];
-    if (cached != nil && ![cached[@"artwork"] boolValue]) {
+    // A sidecar image can appear after the metadata was cached; probe for it once per file per
+    // reload (reset on library / info changes) instead of two stat calls on every configure.
+    if (cached != nil && ![cached[@"artwork"] boolValue] &&
+        ![self.artworkProbed containsObject:path]) {
+        [self.artworkProbed addObject:path];
         NSURL *base = url.URLByDeletingPathExtension;
         for (NSString *extension in @[@"jpg", @"png"]) {
             if ([NSFileManager.defaultManager fileExistsAtPath:[base URLByAppendingPathExtension:extension].path]) {
@@ -1264,7 +1434,12 @@ static UIImage *YTKACEDecodedThumbnail(CGImageSourceRef source) {
     }
     if (cached != nil && [cached[@"size"] longLongValue] == size) {
         [self applyMetadata:cached toCell:cell path:path size:size];
-        return;
+        // Re-decode only when the layout now shows the thumbnail larger than it was decoded for.
+        CGSize decoded = [cached[@"target"] CGSizeValue];
+        if (![cached[@"image"] isKindOfClass:UIImage.class] ||
+            (decoded.width + 0.5 >= target.width && decoded.height + 0.5 >= target.height)) {
+            return;
+        }
     }
     if ([self.metadataLoading containsObject:path]) return;
     [self.metadataLoading addObject:path];
@@ -1275,33 +1450,20 @@ static UIImage *YTKACEDecodedThumbnail(CGImageSourceRef source) {
         AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
         CGSize dimensions = track == nil ? CGSizeZero
             : CGSizeApplyAffineTransform(track.naturalSize, track.preferredTransform);
-        UIImage *thumbnail = nil;
-        NSData *artwork = YTKACEMediaArtworkData(url);
-        if (artwork.length != 0) {
-            CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)artwork, NULL);
-            thumbnail = YTKACEDecodedThumbnail(source);
-            if (source != NULL) CFRelease(source);
-        }
-        if (thumbnail == nil && track != nil) {
-            AVAssetImageGenerator *generator =
-                [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
-            generator.appliesPreferredTrackTransform = YES;
-            generator.maximumSize = CGSizeMake(1280.0, 720.0);
-            CGImageRef image = [generator copyCGImageAtTime:
-                CMTimeMakeWithSeconds(duration > 2.0 ? 1.0 : 0.0, 600)
-                                                    actualTime:NULL error:nil];
-            if (image != NULL) {
-                thumbnail = [UIImage imageWithCGImage:image];
-                CGImageRelease(image);
-            }
-        }
+        BOOL foundArtwork = NO;
+        UIImage *thumbnail = YTKACELibraryThumbnail(url, asset, track, duration, dimensions,
+                                                    target, &foundArtwork);
         NSDictionary *metadata = @{
             @"duration": YTKACEDurationText(duration),
             @"resolution": YTKACEResolutionText(dimensions),
             @"image": thumbnail ?: NSNull.null,
-            @"artwork": @(artwork.length != 0),
-            @"size": @(size)
+            @"artwork": @(foundArtwork),
+            @"size": @(size),
+            @"target": [NSValue valueWithCGSize:target]
         };
+        CGImageRef decoded = thumbnail.CGImage;
+        NSUInteger cost = 1024 + (decoded != NULL
+            ? CGImageGetBytesPerRow(decoded) * CGImageGetHeight(decoded) : 0);
         dispatch_async(dispatch_get_main_queue(), ^{
             YTKACEDownloadsController *strongSelf = weakSelf;
             if (strongSelf == nil) return;
@@ -1319,11 +1481,16 @@ static UIImage *YTKACEDecodedThumbnail(CGImageSourceRef source) {
                 }
                 return;
             }
-            [strongSelf.metadataCache setObject:metadata forKey:path];
+            [strongSelf.metadataCache setObject:metadata forKey:path cost:cost];
+            CGSize needed = [strongSelf thumbnailPixelSize];
+            BOOL tooSmall = thumbnail != nil &&
+                (needed.width > target.width + 0.5 || needed.height > target.height + 0.5);
             for (YTKACEDownloadCell *visible in strongSelf.collectionView.visibleCells) {
                 if ([visible isKindOfClass:YTKACEDownloadCell.class] &&
                     [visible.representedPath isEqualToString:path]) {
                     [strongSelf applyMetadata:metadata toCell:visible path:path size:size];
+                    // The layout changed to a larger thumbnail while this was decoding.
+                    if (tooSmall) [strongSelf loadMetadataForURL:fresh cell:visible size:size];
                 }
             }
         });
@@ -1346,7 +1513,7 @@ static UIImage *YTKACEDecodedThumbnail(CGImageSourceRef source) {
     NSString *sizeText = [NSByteCountFormatter stringFromByteCount:size
                                                         countStyle:NSByteCountFormatterCountStyleFile];
     NSString *details = sizeText;
-    NSString *channel = YTKACEStoredChannelName([NSURL fileURLWithPath:path]);
+    NSString *channel = [self channelNameForPath:path];
     cell.metadataLabel.text = channel.length != 0
         ? [NSString stringWithFormat:@"%@  ·  %@", channel, details] : details;
     cell.thumbnailView.image = image;
@@ -1598,9 +1765,22 @@ didSelectItemAtIndexPath:(NSIndexPath *)indexPath {
     NSDictionary *metadata = [self.metadataCache objectForKey:url.path];
     UIImage *image = [metadata[@"image"] isKindOfClass:UIImage.class]
         ? metadata[@"image"] : nil;
-    if (image != nil) {
-        UIImageWriteToSavedPhotosAlbum(image, nil, nil, NULL);
-    }
+    if (image == nil) return;
+    // The list keeps only a thumbnail sized for its cells; decode the saved copy at the size the
+    // library used to cache (up to 1280 px) off the main thread.
+    [self.metadataQueue addOperationWithBlock:^{
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+        NSTimeInterval duration = CMTimeGetSeconds(asset.duration);
+        AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+        CGSize dimensions = track == nil ? CGSizeZero
+            : CGSizeApplyAffineTransform(track.naturalSize, track.preferredTransform);
+        UIImage *full = YTKACELibraryThumbnail(url, asset, track, duration, dimensions,
+                                               CGSizeMake(1280.0, 1280.0), NULL);
+        UIImage *saved = full ?: image;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIImageWriteToSavedPhotosAlbum(saved, nil, nil, NULL);
+        });
+    }];
 }
 
 - (void)shareURL:(NSURL *)url sourceView:(UIView *)sourceView {
