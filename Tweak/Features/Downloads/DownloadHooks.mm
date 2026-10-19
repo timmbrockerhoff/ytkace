@@ -40,6 +40,8 @@ static id YTKACELastPlayerFactory;
 static id YTKACELastRequestProperties;
 static NSMutableDictionary<NSString *, NSArray *> *YTKACEPlayerRequests;
 static NSMutableDictionary<NSString *, id> *YTKACEPlaybackRequests;
+static NSMutableArray<NSString *> *YTKACEPlayerRequestOrder;
+static NSMutableArray<NSString *> *YTKACEPlaybackRequestOrder;
 static NSInteger YTKACEPlayerHookAttempts;
 static NSString *YTKACELastCapturedVideoID;
 id YTKACELatestPlayerAuthorization;
@@ -359,6 +361,28 @@ static id YTKACECopyObject(id object) {
     return object;
 }
 
+// Requests are remembered per video so a download can replay them, but the
+// maps used to grow by one entry (holding the player service and request
+// objects) for every video watched. Keep only the most recent ones. Callers
+// hold the YTKACESABRDownloader.class lock.
+static const NSUInteger YTKACERequestMemoryLimit = 24;
+
+static void YTKACERememberRequest(NSMutableDictionary *__strong *storage,
+                                  NSMutableArray<NSString *> *__strong *order,
+                                  NSString *videoID,
+                                  id value) {
+    if (videoID.length == 0 || value == nil) return;
+    if (*storage == nil) *storage = [NSMutableDictionary dictionary];
+    if (*order == nil) *order = [NSMutableArray array];
+    [*order removeObject:videoID];
+    [*order addObject:videoID];
+    (*storage)[videoID] = value;
+    while ((*order).count > YTKACERequestMemoryLimit) {
+        [*storage removeObjectForKey:(*order).firstObject];
+        [*order removeObjectAtIndex:0];
+    }
+}
+
 static NSString *YTKACERequestVideoID(id request) {
     id value = YTKACEGetValue(request, @[@"videoId", @"videoID", @"videoIdString"]);
     return [value isKindOfClass:NSString.class] ? value : nil;
@@ -376,9 +400,10 @@ static void YTKACECaptureService(id receiver, id request) {
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
             YTKACEPersistPlayerRequest(requestCopy ?: request);
         });
-        if (YTKACEPlayerRequests == nil) YTKACEPlayerRequests = [NSMutableDictionary dictionary];
-        if (videoID.length != 0) {
-            YTKACEPlayerRequests[videoID] = @[receiver, requestCopy ?: request];
+        id stored = requestCopy ?: request;
+        if (receiver != nil && stored != nil) {
+            YTKACERememberRequest(&YTKACEPlayerRequests, &YTKACEPlayerRequestOrder,
+                                  videoID, @[receiver, stored]);
         }
     }
 }
@@ -510,12 +535,8 @@ static id YTKACEMakePlaybackRequest(id receiver,
     @synchronized (YTKACESABRDownloader.class) {
         YTKACELastPlaybackRequest = YTKACECopyObject(request);
         NSString *videoID = YTKACERequestVideoID(request);
-        if (YTKACEPlaybackRequests == nil) {
-            YTKACEPlaybackRequests = [NSMutableDictionary dictionary];
-        }
-        if (videoID.length != 0) {
-            YTKACEPlaybackRequests[videoID] = YTKACECopyObject(request);
-        }
+        YTKACERememberRequest(&YTKACEPlaybackRequests, &YTKACEPlaybackRequestOrder,
+                              videoID, YTKACECopyObject(request));
     }
     return OriginalMakePlaybackRequest != NULL
         ? ((id (*)(id, SEL, id, id, id))OriginalMakePlaybackRequest)(
@@ -551,18 +572,15 @@ static void YTKACECaptureFactory(id receiver, id request, id properties, id resu
         });
         YTKACELastRequestProperties = properties;
         if (videoID.length != 0 && YTKACELastPlayerService != nil) {
-            if (YTKACEPlayerRequests == nil) {
-                YTKACEPlayerRequests = [NSMutableDictionary dictionary];
+            // A nil request copy inside the array literal used to throw.
+            id requestCopy = YTKACECopyObject(request);
+            if (requestCopy != nil) {
+                YTKACERememberRequest(&YTKACEPlayerRequests, &YTKACEPlayerRequestOrder,
+                                      videoID, @[YTKACELastPlayerService, requestCopy]);
             }
-            YTKACEPlayerRequests[videoID] = @[
-                YTKACELastPlayerService, YTKACECopyObject(request)
-            ];
             if (YTKACELastPlaybackRequest != nil) {
-                if (YTKACEPlaybackRequests == nil) {
-                    YTKACEPlaybackRequests = [NSMutableDictionary dictionary];
-                }
-                YTKACEPlaybackRequests[videoID] =
-                    YTKACECopyObject(YTKACELastPlaybackRequest);
+                YTKACERememberRequest(&YTKACEPlaybackRequests, &YTKACEPlaybackRequestOrder,
+                                      videoID, YTKACECopyObject(YTKACELastPlaybackRequest));
             }
         }
     }
