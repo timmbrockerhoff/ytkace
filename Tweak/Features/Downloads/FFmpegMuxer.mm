@@ -240,29 +240,86 @@ cleanup:
 }
 
 
-static NSMutableSet<NSString *> *YTKACECancelledConversions(void) {
-    static NSMutableSet<NSString *> *set;
+// Conversions that are running, keyed by job identifier. The value turns to
+// @YES when the user cancels; the conversion loops poll it and stop. Entries
+// exist only while a conversion runs, so the table cannot grow without bound.
+static NSMutableDictionary<NSString *, NSNumber *> *YTKACEConversionStates(void) {
+    static NSMutableDictionary<NSString *, NSNumber *> *states;
     static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ set = [NSMutableSet set]; });
-    return set;
+    dispatch_once(&onceToken, ^{ states = [NSMutableDictionary dictionary]; });
+    return states;
+}
+
+static void YTKACEBeginConversion(NSString *identifier) {
+    if (identifier.length == 0) return;
+    NSMutableDictionary<NSString *, NSNumber *> *states = YTKACEConversionStates();
+    @synchronized (states) {
+        states[identifier] = @NO;
+    }
+}
+
+static BOOL YTKACEConversionCancelled(NSString *identifier) {
+    if (identifier.length == 0) return NO;
+    NSMutableDictionary<NSString *, NSNumber *> *states = YTKACEConversionStates();
+    @synchronized (states) {
+        return states[identifier].boolValue;
+    }
+}
+
+static void YTKACEEndConversion(NSString *identifier) {
+    if (identifier.length == 0) return;
+    NSMutableDictionary<NSString *, NSNumber *> *states = YTKACEConversionStates();
+    @synchronized (states) {
+        [states removeObjectForKey:identifier];
+    }
 }
 
 void YTKACEFFmpegCancelConversion(NSString *identifier) {
     if (identifier.length == 0) return;
-    @synchronized (YTKACECancelledConversions()) {
-        [YTKACECancelledConversions() addObject:identifier];
+    NSMutableDictionary<NSString *, NSNumber *> *states = YTKACEConversionStates();
+    BOOL running = NO;
+    @synchronized (states) {
+        if (states[identifier] != nil) {
+            states[identifier] = @YES;
+            running = YES;
+        }
     }
-    YTKACEDownloadLog(@"convert", @"cancel requested %@", identifier);
+    YTKACEDownloadLog(@"convert", @"cancel requested %@ running=%d",
+                      identifier, running);
+}
+
+static NSError *YTKACEConversionCancelledError(void) {
+    return [NSError errorWithDomain:NSCocoaErrorDomain code:NSUserCancelledError
+        userInfo:@{NSLocalizedDescriptionKey: @"Conversion cancelled"}];
+}
+
+// Encodes and writes every packet the encoder has ready. Returns < 0 on a
+// write failure; EAGAIN/EOF from the encoder are not failures.
+static int YTKACEDrainEncoder(AVCodecContext *encoder, AVFormatContext *output,
+                              AVStream *stream, AVPacket *encoded) {
+    int result = 0;
+    while ((result = avcodec_receive_packet(encoder, encoded)) >= 0) {
+        encoded->stream_index = stream->index;
+        av_packet_rescale_ts(encoded, encoder->time_base, stream->time_base);
+        result = av_interleaved_write_frame(output, encoded);
+        av_packet_unref(encoded);
+        if (result < 0) return result;
+    }
+    return (result == AVERROR(EAGAIN) || result == AVERROR_EOF) ? 0 : result;
 }
 
 static NSError *YTKACEAudioToVideo(NSURL *audioURL, NSData *artwork,
-                                   NSURL *outputURL,
+                                   NSURL *outputURL, NSString *identifier,
                                    YTKACEFFmpegProgress progress) {
     NSString *artworkPath = nil;
     if (artwork.length != 0) {
+        // Unique per job so concurrent conversions never share (or delete)
+        // each other's artwork; the YTKACE- prefix lets the startup scratch
+        // purge collect it if the app dies mid-conversion.
         artworkPath = [NSTemporaryDirectory()
-            stringByAppendingPathComponent:@"ytkace-art.jpg"];
-        [artwork writeToFile:artworkPath atomically:YES];
+            stringByAppendingPathComponent:[NSString stringWithFormat:
+                @"YTKACE-art-%@.jpg", NSUUID.UUID.UUIDString]];
+        if (![artwork writeToFile:artworkPath atomically:YES]) artworkPath = nil;
     }
     AVFormatContext *audioInput = NULL;
     AVFormatContext *imageInput = NULL;
@@ -273,9 +330,16 @@ static NSError *YTKACEAudioToVideo(NSURL *audioURL, NSData *artwork,
     AVFrame *imageFrame = av_frame_alloc();
     AVFrame *videoFrame = av_frame_alloc();
     AVPacket *packet = av_packet_alloc();
+    AVPacket *encoded = av_packet_alloc();
     NSError *error = nil;
     int audioIndex = -1;
+    int status = 0;
 
+    if (imageFrame == NULL || videoFrame == NULL || packet == NULL ||
+        encoded == NULL) {
+        error = YTKACEFFmpegError(AVERROR(ENOMEM), @"Could not convert");
+        goto finish;
+    }
     if (avformat_open_input(&audioInput, audioURL.path.UTF8String, NULL, NULL) < 0 ||
         avformat_find_stream_info(audioInput, NULL) < 0) {
         error = YTKACEFFmpegError(-1, @"Could not read the audio");
@@ -308,6 +372,10 @@ static NSError *YTKACEAudioToVideo(NSURL *audioURL, NSData *artwork,
             goto finish;
         }
         encoder = avcodec_alloc_context3(encoderCodec);
+        if (encoder == NULL) {
+            error = YTKACEFFmpegError(AVERROR(ENOMEM), @"Conversion is unavailable");
+            goto finish;
+        }
         encoder->width = width;
         encoder->height = height;
         encoder->pix_fmt = AV_PIX_FMT_NV12;
@@ -322,12 +390,20 @@ static NSError *YTKACEAudioToVideo(NSURL *audioURL, NSData *artwork,
             goto finish;
         }
         AVStream *videoStream = avformat_new_stream(output, NULL);
-        avcodec_parameters_from_context(videoStream->codecpar, encoder);
+        if (videoStream == NULL ||
+            avcodec_parameters_from_context(videoStream->codecpar, encoder) < 0) {
+            error = YTKACEFFmpegError(AVERROR(ENOMEM), @"Could not create the file");
+            goto finish;
+        }
         videoStream->codecpar->codec_tag = MKTAG('a', 'v', 'c', '1');
         videoStream->time_base = encoder->time_base;
         AVStream *audioStream = avformat_new_stream(output, NULL);
-        avcodec_parameters_copy(audioStream->codecpar,
-                                audioInput->streams[audioIndex]->codecpar);
+        if (audioStream == NULL ||
+            avcodec_parameters_copy(audioStream->codecpar,
+                                    audioInput->streams[audioIndex]->codecpar) < 0) {
+            error = YTKACEFFmpegError(AVERROR(ENOMEM), @"Could not create the file");
+            goto finish;
+        }
         audioStream->codecpar->codec_tag = 0;
 
         if (!(output->oformat->flags & AVFMT_NOFILE)) {
@@ -345,7 +421,11 @@ static NSError *YTKACEAudioToVideo(NSURL *audioURL, NSData *artwork,
         videoFrame->format = AV_PIX_FMT_NV12;
         videoFrame->width = width;
         videoFrame->height = height;
-        av_frame_get_buffer(videoFrame, 0);
+        status = av_frame_get_buffer(videoFrame, 0);
+        if (status < 0) {
+            error = YTKACEFFmpegError(status, @"Could not convert");
+            goto finish;
+        }
         memset(videoFrame->data[0], 16, (size_t)videoFrame->linesize[0] * height);
         memset(videoFrame->data[1], 128,
                (size_t)videoFrame->linesize[1] * height / 2);
@@ -354,14 +434,16 @@ static NSError *YTKACEAudioToVideo(NSURL *audioURL, NSData *artwork,
             (unsigned long)artwork.length, artworkPath ?: @"none");
         if (artworkPath != nil &&
             avformat_open_input(&imageInput, artworkPath.UTF8String, NULL, NULL) >= 0 &&
-            avformat_find_stream_info(imageInput, NULL) >= 0) {
+            avformat_find_stream_info(imageInput, NULL) >= 0 &&
+            imageInput->nb_streams > 0) {
             const AVCodec *imageCodec =
                 avcodec_find_decoder(imageInput->streams[0]->codecpar->codec_id);
             if (imageCodec != NULL) {
                 imageDecoder = avcodec_alloc_context3(imageCodec);
-                avcodec_parameters_to_context(imageDecoder,
-                                              imageInput->streams[0]->codecpar);
-                if (avcodec_open2(imageDecoder, imageCodec, NULL) >= 0 &&
+                if (imageDecoder != NULL &&
+                    avcodec_parameters_to_context(imageDecoder,
+                        imageInput->streams[0]->codecpar) >= 0 &&
+                    avcodec_open2(imageDecoder, imageCodec, NULL) >= 0 &&
                     av_read_frame(imageInput, packet) >= 0 &&
                     avcodec_send_packet(imageDecoder, packet) >= 0 &&
                     avcodec_receive_frame(imageDecoder, imageFrame) >= 0) {
@@ -384,44 +466,61 @@ static NSError *YTKACEAudioToVideo(NSURL *audioURL, NSData *artwork,
             ? audioInput->duration / AV_TIME_BASE : 0;
         const int64_t frames = MAX((int64_t)1, duration);
         for (int64_t index = 0; index < frames; index++) {
+            if (YTKACEConversionCancelled(identifier)) {
+                error = YTKACEConversionCancelledError();
+                goto finish;
+            }
             videoFrame->pts = index;
             if (avcodec_send_frame(encoder, videoFrame) >= 0) {
-                AVPacket *encoded = av_packet_alloc();
-                while (avcodec_receive_packet(encoder, encoded) >= 0) {
-                    encoded->stream_index = videoStream->index;
-                    av_packet_rescale_ts(encoded, encoder->time_base,
-                                         videoStream->time_base);
-                    av_interleaved_write_frame(output, encoded);
-                    av_packet_unref(encoded);
+                status = YTKACEDrainEncoder(encoder, output, videoStream, encoded);
+                if (status < 0) {
+                    error = YTKACEFFmpegError(status, @"Write video");
+                    goto finish;
                 }
-                av_packet_free(&encoded);
             }
             if (progress != nil && frames > 0) {
                 progress(MIN(1.0, (double)(index + 1) / (double)frames));
             }
         }
         avcodec_send_frame(encoder, NULL);
-        AVPacket *flush = av_packet_alloc();
-        while (avcodec_receive_packet(encoder, flush) >= 0) {
-            flush->stream_index = videoStream->index;
-            av_packet_rescale_ts(flush, encoder->time_base,
-                                 videoStream->time_base);
-            av_interleaved_write_frame(output, flush);
-            av_packet_unref(flush);
+        status = YTKACEDrainEncoder(encoder, output, videoStream, encoded);
+        if (status < 0) {
+            error = YTKACEFFmpegError(status, @"Write video");
+            goto finish;
         }
-        av_packet_free(&flush);
 
-        while (av_read_frame(audioInput, packet) >= 0) {
+        uint32_t audioPackets = 0;
+        while ((status = av_read_frame(audioInput, packet)) >= 0) {
+            if ((++audioPackets & 0xFF) == 0 &&
+                YTKACEConversionCancelled(identifier)) {
+                av_packet_unref(packet);
+                error = YTKACEConversionCancelledError();
+                goto finish;
+            }
             if (packet->stream_index == audioIndex) {
                 packet->stream_index = audioStream->index;
                 av_packet_rescale_ts(packet,
                     audioInput->streams[audioIndex]->time_base,
                     audioStream->time_base);
-                av_interleaved_write_frame(output, packet);
+                packet->pos = -1;
+                status = av_interleaved_write_frame(output, packet);
+                if (status < 0) {
+                    av_packet_unref(packet);
+                    error = YTKACEFFmpegError(status, @"Write audio");
+                    goto finish;
+                }
             }
             av_packet_unref(packet);
         }
-        av_write_trailer(output);
+        if (status != AVERROR_EOF) {
+            error = YTKACEFFmpegError(status, @"Read audio");
+            goto finish;
+        }
+        status = av_write_trailer(output);
+        if (status < 0) {
+            error = YTKACEFFmpegError(status, @"Write trailer");
+            goto finish;
+        }
     }
 
 finish:
@@ -439,8 +538,12 @@ finish:
     av_frame_free(&imageFrame);
     av_frame_free(&videoFrame);
     av_packet_free(&packet);
+    av_packet_free(&encoded);
     if (artworkPath != nil) {
         [NSFileManager.defaultManager removeItemAtPath:artworkPath error:NULL];
+    }
+    if (error != nil) {
+        [NSFileManager.defaultManager removeItemAtURL:outputURL error:NULL];
     }
     return error;
 }
@@ -539,11 +642,85 @@ static NSString *YTKACEMP4LanguageCode(NSString *language) {
     });
 }
 
-static BOOL YTKACEPatchTextSampleDescription(NSURL *URL,
-                                             int width,
-                                             int height) {
-    NSMutableData *data = [NSMutableData dataWithContentsOfURL:URL];
-    if (data.length < 64) return NO;
+static uint64_t YTKACEReadBE(const uint8_t *bytes, NSUInteger count) {
+    uint64_t value = 0;
+    for (NSUInteger index = 0; index < count; index++) {
+        value = (value << 8) | bytes[index];
+    }
+    return value;
+}
+
+// Largest moov box we are willing to load to patch subtitles. A moov is
+// sample tables only (no media), so even multi-hour videos stay far below it.
+static const uint64_t YTKACEMaxPatchedMoovSize = 64ull * 1024 * 1024;
+
+// Rewrites the tx3g sample entries so iOS draws the subtitles bottom-centered
+// at a readable size. Only the moov box is read and written back in place at
+// the same offset (the patch never changes its length), so large videos are
+// never loaded into memory and mdat media bytes are never scanned or touched.
+// Returns 1 when patched, 0 when there was nothing to patch, -1 when writing
+// the patch failed (the file may then be damaged and must not be used).
+static int YTKACEPatchTextSampleDescription(NSURL *URL,
+                                            int width,
+                                            int height) {
+    NSError *ioError = nil;
+    NSFileHandle *handle = [NSFileHandle fileHandleForUpdatingURL:URL
+                                                            error:&ioError];
+    if (handle == nil) {
+        YTKACEDownloadLog(@"subs", @"tx3g patch open failed: %@",
+                          ioError.localizedDescription);
+        return 0;
+    }
+    unsigned long long fileSize = 0;
+    if (![handle seekToEndReturningOffset:&fileSize error:&ioError]) {
+        [handle closeAndReturnError:nil];
+        return 0;
+    }
+    uint64_t offset = 0;
+    uint64_t moovOffset = 0;
+    uint64_t moovSize = 0;
+    while (offset + 8 <= fileSize) {
+        if (![handle seekToOffset:offset error:&ioError]) break;
+        NSData *header = [handle readDataUpToLength:16 error:&ioError];
+        if (header.length < 8) break;
+        const uint8_t *box = (const uint8_t *)header.bytes;
+        uint64_t size = YTKACEReadBE(box, 4);
+        uint64_t headerSize = 8;
+        if (size == 1) {
+            if (header.length < 16) break;
+            size = YTKACEReadBE(box + 8, 8);
+            headerSize = 16;
+        } else if (size == 0) {
+            size = fileSize - offset;
+        }
+        if (size < headerSize || size > fileSize - offset) break;
+        if (memcmp(box + 4, "moov", 4) == 0) {
+            moovOffset = offset;
+            moovSize = size;
+            break;
+        }
+        offset += size;
+    }
+    if (moovSize < 64) {
+        [handle closeAndReturnError:nil];
+        return 0;
+    }
+    if (moovSize > YTKACEMaxPatchedMoovSize) {
+        YTKACEDownloadLog(@"subs", @"tx3g patch skipped: moov is %llu bytes",
+                          (unsigned long long)moovSize);
+        [handle closeAndReturnError:nil];
+        return 0;
+    }
+    NSData *moov = nil;
+    if ([handle seekToOffset:moovOffset error:&ioError]) {
+        moov = [handle readDataUpToLength:(NSUInteger)moovSize error:&ioError];
+    }
+    if (moov.length != moovSize) {
+        [handle closeAndReturnError:nil];
+        return 0;
+    }
+    NSMutableData *data = [moov mutableCopy];
+    moov = nil;
     uint8_t *bytes = (uint8_t *)data.mutableBytes;
     const NSUInteger length = data.length;
     NSUInteger patched = 0;
@@ -582,11 +759,26 @@ static BOOL YTKACEPatchTextSampleDescription(NSURL *URL,
         bytes[cursor++] = 0xFF;
         patched++;
     }
-    if (patched == 0) return NO;
-    if (![data writeToURL:URL atomically:YES]) return NO;
+    if (patched == 0) {
+        [handle closeAndReturnError:nil];
+        return 0;
+    }
+    if (![handle seekToOffset:moovOffset error:&ioError] ||
+        ![handle writeData:data error:&ioError] ||
+        ![handle synchronizeAndReturnError:&ioError]) {
+        YTKACEDownloadLog(@"subs", @"tx3g patch write failed: %@",
+                          ioError.localizedDescription);
+        [handle closeAndReturnError:nil];
+        return -1;
+    }
+    if (![handle closeAndReturnError:&ioError]) {
+        YTKACEDownloadLog(@"subs", @"tx3g patch close failed: %@",
+                          ioError.localizedDescription);
+        return -1;
+    }
     YTKACEDownloadLog(@"subs", @"patched %lu tx3g entries %dx%d",
                       (unsigned long)patched, width, height);
-    return YES;
+    return 1;
 }
 
 + (void)muxSubtitlesIntoURL:(NSURL *)mediaURL
@@ -744,23 +936,34 @@ static BOOL YTKACEPatchTextSampleDescription(NSURL *URL,
                 failure = YTKACEFFmpegError(AVERROR(ENOMEM), @"subtitle packet");
                 break;
             }
-            while (av_read_frame(input, packet) >= 0) {
-                const int mapped = streamMap[packet->stream_index];
-                if (mapped < 0) {
+            // nb_streams can grow while reading (streams found after the
+            // header); those were never mapped, so remember the mapped count.
+            const unsigned int mappedStreams = input->nb_streams;
+            while ((status = av_read_frame(input, packet)) >= 0) {
+                if (packet->stream_index < 0 ||
+                    (unsigned int)packet->stream_index >= mappedStreams ||
+                    streamMap[packet->stream_index] < 0) {
                     av_packet_unref(packet);
                     continue;
                 }
+                const int mapped = streamMap[packet->stream_index];
                 AVStream *source = input->streams[packet->stream_index];
                 AVStream *destination = output->streams[mapped];
                 av_packet_rescale_ts(packet, source->time_base,
                                      destination->time_base);
                 packet->stream_index = mapped;
                 packet->pos = -1;
-                if (av_interleaved_write_frame(output, packet) < 0) {
-                    av_packet_unref(packet);
+                status = av_interleaved_write_frame(output, packet);
+                av_packet_unref(packet);
+                if (status < 0) {
+                    failure = YTKACEFFmpegError(status, @"subtitle media write");
                     break;
                 }
-                av_packet_unref(packet);
+            }
+            if (failure != nil) break;
+            if (status != AVERROR_EOF) {
+                failure = YTKACEFFmpegError(status, @"subtitle media read");
+                break;
             }
 
             for (NSDictionary *cue in YTKACENormalizedCues(cues)) {
@@ -783,15 +986,16 @@ static BOOL YTKACEPatchTextSampleDescription(NSURL *URL,
                 packet->duration = (int64_t)((end - start) * 1000.0);
                 packet->pos = -1;
                 const int rc = av_interleaved_write_frame(output, packet);
+                av_packet_unref(packet);
                 if (rc < 0) {
                     YTKACEDownloadLog(@"subs", @"cue write failed: %@",
                                       YTKACEFFmpegMessage(rc));
-                    av_packet_unref(packet);
+                    failure = YTKACEFFmpegError(rc, @"subtitle cue write");
                     break;
                 }
                 written++;
-                av_packet_unref(packet);
             }
+            if (failure != nil) break;
 
             status = av_write_trailer(output);
             if (status < 0) {
@@ -808,17 +1012,21 @@ static BOOL YTKACEPatchTextSampleDescription(NSURL *URL,
             }
             avformat_free_context(output);
         }
+        if (failure == nil) {
+            YTKACEDownloadLog(@"subs", @"muxed %ld/%lu cues written",
+                              (long)written, (unsigned long)cues.count);
+            const int patch = YTKACEPatchTextSampleDescription(
+                outputURL, videoWidth, videoHeight);
+            if (patch == 0) {
+                YTKACEDownloadLog(@"subs", @"tx3g patch skipped");
+            } else if (patch < 0) {
+                failure = YTKACEFFmpegError(AVERROR(EIO), @"subtitle patch");
+            }
+        }
         if (failure != nil) {
             [NSFileManager.defaultManager removeItemAtURL:outputURL error:nil];
             YTKACEDownloadLog(@"subs", @"mux failed: %@",
                               failure.localizedDescription);
-        } else {
-            YTKACEDownloadLog(@"subs", @"muxed %ld/%lu cues written",
-                              (long)written, (unsigned long)cues.count);
-            if (!YTKACEPatchTextSampleDescription(outputURL, videoWidth,
-                                                  videoHeight)) {
-                YTKACEDownloadLog(@"subs", @"tx3g patch skipped");
-            }
         }
         dispatch_async(dispatch_get_main_queue(), ^{ completion(failure); });
     });
@@ -887,12 +1095,19 @@ static BOOL YTKACEPatchTextSampleDescription(NSURL *URL,
 + (void)videoFromAudioURL:(NSURL *)audioURL
              artworkData:(NSData *)artworkData
                 outputURL:(NSURL *)outputURL
+               identifier:(NSString *)identifier
                  progress:(YTKACEFFmpegProgress)progress
                completion:(YTKACEFFmpegCompletion)completion {
+    NSString *token = [identifier copy];
+    // Registered before the hop so a cancel that arrives while the block is
+    // still queued is not lost.
+    YTKACEBeginConversion(token);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         const CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
+        [NSFileManager.defaultManager removeItemAtURL:outputURL error:nil];
         NSError *error = YTKACEAudioToVideo(audioURL, artworkData, outputURL,
-                                            progress);
+                                            token, progress);
+        YTKACEEndConversion(token);
         YTKACEDownloadLog(@"convert", @"audio video elapsed=%.1fs error=%@",
             CFAbsoluteTimeGetCurrent() - started,
             error.localizedDescription ?: @"none");

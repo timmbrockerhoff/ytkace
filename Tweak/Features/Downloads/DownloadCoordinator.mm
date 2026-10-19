@@ -47,7 +47,17 @@
 @property(nonatomic, assign) BOOL sharesFile;
 @property(nonatomic, strong, nullable) NSURL *captionURL;
 @property(nonatomic, copy, nullable) NSString *captionLanguage;
+// Keeps the process running while the job downloads/muxes after the user
+// leaves the app. Only touched on the main thread.
+@property(nonatomic, assign) UIBackgroundTaskIdentifier backgroundTask;
 @end
+
+// UIApplication is unavailable in app extensions; never touch it there.
+static UIApplication *YTKACEBackgroundTaskApplication(void) {
+    if ([NSBundle.mainBundle.bundlePath hasSuffix:@".appex"]) return nil;
+    if (![UIApplication respondsToSelector:@selector(sharedApplication)]) return nil;
+    return UIApplication.sharedApplication;
+}
 
 static const void *YTKACEShortsFullscreenKey = &YTKACEShortsFullscreenKey;
 static const void *YTKACEShortsFullscreenAlphaKey =
@@ -192,6 +202,11 @@ void YTKACESetShortsNewFullscreen(UIView *container, BOOL fullscreen) {
 }
 
 @implementation YTKACEDownloadJob
+- (instancetype)init {
+    self = [super init];
+    if (self) _backgroundTask = UIBackgroundTaskInvalid;
+    return self;
+}
 @end
 
 @interface YTKACEDownloadCoordinator () <NSURLSessionDownloadDelegate>
@@ -232,6 +247,10 @@ void YTKACESetShortsNewFullscreen(UIView *container, BOOL fullscreen) {
 - (NSString *)safeFilename:(NSString *)filename;
 - (NSString *)failureMessageForError:(nullable NSError *)error
                                   job:(nullable YTKACEDownloadJob *)job;
+- (void)beginBackgroundTaskForJob:(YTKACEDownloadJob *)job;
+- (void)endBackgroundTaskForJob:(YTKACEDownloadJob *)job;
+- (void)retireJob:(YTKACEDownloadJob *)job;
+- (void)finishCancelledJob:(YTKACEDownloadJob *)job;
 @end
 
 static NSString * const YTKACESaveLocationKey =
@@ -334,10 +353,13 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
                 job.cancelled = YES;
                 [YTKACEDownloadProgressView.sharedView finishJob:identifier
                     success:NO message:YTKACELocalized(@"Cancelled")];
-                [weakSelf.activeJobs removeObjectForKey:identifier];
+                [weakSelf retireJob:job];
                 YTKACEDownloadLog(identifier, @"cancelled before start");
                 return;
             }
+            // Also flag the job so a merge/remux that is already running, or
+            // a pending fallback/retry, drops its result instead of saving it.
+            job.cancelled = YES;
             [job.sabrTask cancel];
             [job.directTask cancel];
             YTKACEFFmpegCancelConversion(identifier);
@@ -1489,12 +1511,62 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
             (unsigned long)self.activeJobs.count);
         [YTKACEDownloadProgressView.sharedView updateJob:job.identifier
             stage:YTKACELocalized(@"Preparing download") progress:0.0 downloadedBytes:0 totalBytes:0];
+        [self beginBackgroundTaskForJob:job];
         if (job.useDirect) {
             [self startDirectJob:job];
         } else {
             [self startSABRJob:job];
         }
     }
+}
+
+- (void)beginBackgroundTaskForJob:(YTKACEDownloadJob *)job {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self beginBackgroundTaskForJob:job];
+        });
+        return;
+    }
+    if (job.backgroundTask != UIBackgroundTaskInvalid) return;
+    UIApplication *application = YTKACEBackgroundTaskApplication();
+    if (application == nil) return;
+    __weak YTKACEDownloadCoordinator *weakSelf = self;
+    // The job is captured strongly so the task can always be ended; UIKit
+    // releases this block once the task ends.
+    job.backgroundTask = [application
+        beginBackgroundTaskWithName:@"YTKACE download"
+                  expirationHandler:^{
+            YTKACEDownloadLog(job.identifier, @"background time expired");
+            [weakSelf endBackgroundTaskForJob:job];
+        }];
+}
+
+- (void)endBackgroundTaskForJob:(YTKACEDownloadJob *)job {
+    if (job == nil) return;
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self endBackgroundTaskForJob:job];
+        });
+        return;
+    }
+    const UIBackgroundTaskIdentifier task = job.backgroundTask;
+    if (task == UIBackgroundTaskInvalid) return;
+    job.backgroundTask = UIBackgroundTaskInvalid;
+    [YTKACEBackgroundTaskApplication() endBackgroundTask:task];
+}
+
+// Every exit path of a job (finished, failed, cancelled) goes through here.
+- (void)retireJob:(YTKACEDownloadJob *)job {
+    if (job == nil) return;
+    [self.activeJobs removeObjectForKey:job.identifier];
+    [self endBackgroundTaskForJob:job];
+}
+
+- (void)finishCancelledJob:(YTKACEDownloadJob *)job {
+    [YTKACEDownloadProgressView.sharedView finishJob:job.identifier
+        success:NO message:YTKACELocalized(@"Cancelled")];
+    YTKACEDownloadLog(job.identifier, @"cancelled");
+    [self retireJob:job];
 }
 
 - (void)retryJobWithIdentifier:(NSString *)identifier {
@@ -1714,6 +1786,13 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
         YTKACEDownloadLog(job.identifier, @"audio remux start");
         [YTKACEFFmpegMuxer remuxAudioURL:audioURL outputURL:output
             completion:^(NSError *remuxError) {
+                if (job.cancelled) {
+                    [NSFileManager.defaultManager
+                        removeItemAtURL:audioURL.URLByDeletingLastPathComponent
+                        error:nil];
+                    [self finishCancelledJob:job];
+                    return;
+                }
                 if (remuxError != nil) {
                     [YTKACEDownloadProgressView.sharedView
                         finishJob:job.identifier success:NO message:YTKACELocalized(@"Failed")];
@@ -1726,7 +1805,7 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
                     [self showAlertWithTitle:YTKACELocalized(@"Download failed")
                         message:[self failureMessageForError:remuxError
                             job:job]];
-                    [self.activeJobs removeObjectForKey:job.identifier];
+                    [self retireJob:job];
                     return;
                 }
                 [NSFileManager.defaultManager removeItemAtURL:audioURL error:nil];
@@ -1773,7 +1852,10 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
 }
 
 - (void)startDirectJob:(YTKACEDownloadJob *)job {
-    if (job.cancelled) return;
+    if (job.cancelled) {
+        [self finishCancelledJob:job];
+        return;
+    }
     __weak YTKACEDownloadCoordinator *weakSelf = self;
     job.directTask = [YTKACEDirectDownloader downloadVideoID:job.videoID
         videoOption:job.audioOnly ? nil : job.videoOption audioOption:job.audioOption
@@ -1792,21 +1874,23 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
                 [strongSelf completeJob:job videoURL:videoURL audioURL:audioURL];
                 return;
             }
-            if ([error.domain isEqualToString:NSURLErrorDomain] &&
-                error.code == NSURLErrorCancelled) {
-                [YTKACEDownloadProgressView.sharedView finishJob:job.identifier
-                    success:NO message:YTKACELocalized(@"Cancelled")];
-                [strongSelf.activeJobs removeObjectForKey:job.identifier];
+            if (job.cancelled || ([error.domain isEqualToString:NSURLErrorDomain] &&
+                error.code == NSURLErrorCancelled)) {
+                [strongSelf finishCancelledJob:job];
                 return;
             }
-            YTKACEDownloadLog(job.identifier, @"direct failed error=%@ fallback=sabr",
-                error.localizedDescription ?: @"incomplete");
-            if (![strongSelf prepareSABRFallbackForJob:job]) {
+            // Disk full: SABR would hit the same wall, so report it directly.
+            const BOOL storageFailure =
+                [error.domain isEqualToString:@"YTKACEStorage"];
+            YTKACEDownloadLog(job.identifier, @"direct failed error=%@ fallback=%@",
+                error.localizedDescription ?: @"incomplete",
+                storageFailure ? @"none" : @"sabr");
+            if (storageFailure || ![strongSelf prepareSABRFallbackForJob:job]) {
                 [YTKACEDownloadProgressView.sharedView finishJob:job.identifier
                     success:NO message:YTKACELocalized(@"Failed")];
                 [strongSelf showAlertWithTitle:YTKACELocalized(@"Download failed")
                     message:[strongSelf failureMessageForError:error job:job]];
-                [strongSelf.activeJobs removeObjectForKey:job.identifier];
+                [strongSelf retireJob:job];
                 return;
             }
             job.useDirect = NO;
@@ -1818,7 +1902,10 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
 }
 
 - (void)startSABRJob:(YTKACEDownloadJob *)job {
-    if (job.cancelled) return;
+    if (job.cancelled) {
+        [self finishCancelledJob:job];
+        return;
+    }
     __weak YTKACEDownloadCoordinator *weakSelf = self;
     job.sabrTask = [YTKACESABRDownloader downloadPlayerResponse:job.playerResponse
         videoOption:job.videoOption audioOption:job.audioOption audioOnly:job.audioOnly
@@ -1833,6 +1920,10 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
         completion:^(NSURL *videoURL, NSURL *audioURL, NSError *error) {
             if (error != nil || audioURL == nil || (!job.audioOnly && videoURL == nil)) {
                 YTKACEStreamOption *fallback = nil;
+                if (job.cancelled) {
+                    [weakSelf finishCancelledJob:job];
+                    return;
+                }
                 if ([error.domain isEqualToString:@"YTKACESABR"] &&
                     error.code == 8) {
                     fallback = [weakSelf fallbackVideoForJob:job];
@@ -1865,7 +1956,7 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
                     [weakSelf showAlertWithTitle:YTKACELocalized(@"Download failed")
                         message:[weakSelf failureMessageForError:error job:job]];
                 }
-                [weakSelf.activeJobs removeObjectForKey:job.identifier];
+                [weakSelf retireJob:job];
                 return;
             }
             [weakSelf completeJob:job videoURL:videoURL audioURL:audioURL];
@@ -1915,8 +2006,16 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
             NSURLResponse *response, NSError *error) {
         (void)response;
         if (error == nil && data.length != 0) {
-            UIImage *image = [UIImage imageWithData:data];
-            NSData *artwork = image == nil ? data : UIImageJPEGRepresentation(image, 0.9);
+            // Thumbnails are almost always JPEG already: keep those bytes
+            // as-is instead of decoding and re-encoding them.
+            const uint8_t *magic = (const uint8_t *)data.bytes;
+            const BOOL isJPEG = data.length >= 3 && magic[0] == 0xFF &&
+                magic[1] == 0xD8 && magic[2] == 0xFF;
+            NSData *artwork = data;
+            if (!isJPEG) {
+                UIImage *image = [UIImage imageWithData:data];
+                if (image != nil) artwork = UIImageJPEGRepresentation(image, 0.9) ?: data;
+            }
             [artwork writeToURL:imageURL atomically:YES];
             YTKACEDownloadLog(identifier, @"thumbnail saved bytes=%lu",
                 (unsigned long)artwork.length);
@@ -1969,16 +2068,33 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
                                       language:language
                                      outputURL:staging
                                     completion:^(NSError *muxError) {
-            if (muxError == nil &&
-                [NSFileManager.defaultManager fileExistsAtPath:staging.path]) {
-                [NSFileManager.defaultManager removeItemAtURL:destination
-                                                        error:nil];
-                [NSFileManager.defaultManager moveItemAtURL:staging
-                                                      toURL:destination
-                                                      error:nil];
-            } else {
-                [NSFileManager.defaultManager removeItemAtURL:staging error:nil];
+            NSFileManager *manager = NSFileManager.defaultManager;
+            // Only replace the original with an output that finished cleanly
+            // and is plausibly complete: same packets plus a text track, so
+            // it cannot be much smaller than the original.
+            const unsigned long long original =
+                [manager attributesOfItemAtPath:destination.path error:nil].fileSize;
+            const unsigned long long muxed =
+                [manager attributesOfItemAtPath:staging.path error:nil].fileSize;
+            const BOOL sane = muxed > 0 && muxed >= original / 10 * 9;
+            if (muxError == nil && sane) {
+                // Move the original aside first so it can be restored if the
+                // swap fails; it is never deleted before the new file is in.
+                NSURL *backup = [destination.URLByDeletingLastPathComponent
+                    URLByAppendingPathComponent:[@"." stringByAppendingString:
+                        NSUUID.UUID.UUIDString]];
+                if ([manager moveItemAtURL:destination toURL:backup error:nil]) {
+                    if ([manager moveItemAtURL:staging toURL:destination error:nil]) {
+                        [manager removeItemAtURL:backup error:nil];
+                    } else {
+                        [manager moveItemAtURL:backup toURL:destination error:nil];
+                    }
+                }
+            } else if (muxError == nil) {
+                YTKACEDownloadLog(@"subs", @"muxed file rejected size=%llu original=%llu",
+                                  muxed, original);
             }
+            [manager removeItemAtURL:staging error:nil];
             handler();
         }];
     });
@@ -2026,11 +2142,17 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
                     [strongSelf presentShareSheetForURL:destination];
                 }
             }
-            [strongSelf.activeJobs removeObjectForKey:job.identifier];
+            if (job.savesToPhotos) {
+                // The Photos conversion/import is still running: keep the
+                // background task until deliverToPhotosJob finishes.
+                [strongSelf.activeJobs removeObjectForKey:job.identifier];
+            } else {
+                [strongSelf retireJob:job];
+            }
         }];
         return;
     }
-    [self.activeJobs removeObjectForKey:job.identifier];
+    [self retireJob:job];
 }
 
 - (void)squareArtworkForJob:(YTKACEDownloadJob *)job
@@ -2081,8 +2203,9 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
 - (void)prepareForPhotosJob:(YTKACEDownloadJob *)job
                 destination:(NSURL *)destination
                        then:(void (^)(NSURL *ready))handler {
+    // YTKACE- prefix: the startup scratch purge removes it if we die mid-way.
     NSURL *converted = [[NSURL fileURLWithPath:NSTemporaryDirectory()]
-        URLByAppendingPathComponent:[NSString stringWithFormat:@"photos-%@.mp4",
+        URLByAppendingPathComponent:[NSString stringWithFormat:@"YTKACE-photos-%@.mp4",
             job.identifier]];
     void (^report)(double) = ^(double fraction) {
         [YTKACEDownloadProgressView.sharedView updateJob:job.identifier
@@ -2090,10 +2213,33 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
             downloadedBytes:0 totalBytes:0];
     };
     if (job.audioOnly) {
+        __weak YTKACEDownloadCoordinator *weakSelf = self;
         [self squareArtworkForJob:job then:^(NSData *artwork) {
             [YTKACEFFmpegMuxer videoFromAudioURL:destination artworkData:artwork
-                outputURL:converted progress:report completion:^(NSError *error) {
-                handler(error == nil ? converted : destination);
+                outputURL:converted identifier:job.identifier progress:report
+                completion:^(NSError *error) {
+                if (error == nil) {
+                    handler(converted);
+                    return;
+                }
+                [NSFileManager.defaultManager removeItemAtURL:converted error:nil];
+                if ([error.domain isEqualToString:NSCocoaErrorDomain] &&
+                    error.code == NSUserCancelledError) {
+                    // Cancelled while converting: the download itself is
+                    // already in the library, so keep it there.
+                    YTKACEDownloadCoordinator *strongSelf = weakSelf;
+                    [YTKACEDownloadProgressView.sharedView finishJob:job.identifier
+                        success:NO message:YTKACELocalized(@"Cancelled")];
+                    YTKACEDownloadLog(job.identifier,
+                        @"photos conversion cancelled; kept in library");
+                    [strongSelf writeMetadataForJob:job destination:destination];
+                    [NSNotificationCenter.defaultCenter
+                        postNotificationName:@"YTKACEDownloadLibraryChanged"
+                                      object:nil];
+                    [strongSelf endBackgroundTaskForJob:job];
+                    return;
+                }
+                handler(destination);
             }];
         }];
         return;
@@ -2138,6 +2284,7 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
             }
             [NSNotificationCenter.defaultCenter
                 postNotificationName:@"YTKACEDownloadLibraryChanged" object:nil];
+            [weakSelf endBackgroundTaskForJob:job];
         });
     }
 }
@@ -2197,6 +2344,12 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
     __weak YTKACEDownloadCoordinator *weakSelf = self;
     [YTKACEFFmpegMuxer remuxVideoURL:videoURL audioURL:audioURL
         outputURL:output completion:^(NSError *error) {
+            if (job.cancelled) {
+                [NSFileManager.defaultManager
+                    removeItemAtURL:videoURL.URLByDeletingLastPathComponent error:nil];
+                [weakSelf finishCancelledJob:job];
+                return;
+            }
             if (error != nil) {
                 [YTKACEDownloadProgressView.sharedView finishJob:job.identifier
                     success:NO message:YTKACELocalized(@"Failed")];
@@ -2207,7 +2360,7 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
                 [NSFileManager.defaultManager removeItemAtURL:output error:nil];
                 [NSFileManager.defaultManager
                     removeItemAtURL:videoURL.URLByDeletingLastPathComponent error:nil];
-                [weakSelf.activeJobs removeObjectForKey:job.identifier];
+                [weakSelf retireJob:job];
                 return;
             }
             [NSFileManager.defaultManager removeItemAtURL:videoURL error:nil];
