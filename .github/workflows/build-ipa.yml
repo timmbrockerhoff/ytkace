@@ -69,7 +69,10 @@ jobs:
 
   package:
     needs: [build, plan]
-    runs-on: macos-15
+    # Packaging only unzips, patches and re-signs the IPA, which works on
+    # Linux. Hosted macOS runners are often unavailable for long stretches
+    # (jobs were cancelled after 15 minutes in the queue).
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -85,7 +88,14 @@ jobs:
       - uses: levibostian/action-hide-sensitive-inputs@39cfbde19b3251728d2357dd0648172d1202c1ee # v1.2.1
 
       - name: Setup
-        run: brew install ldid dpkg
+        env:
+          LDID_URL: https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
+          LDID_SHA256: 4b8862b2fefa2cd7fa8f88cb0310779619aeaa8c72d6aff22f019b470f2fa99a
+        run: |
+          curl --fail --location "$LDID_URL" --output ldid
+          echo "${LDID_SHA256}  ldid" | sha256sum -c -
+          sudo install -m 0755 ldid /usr/local/bin/ldid
+          rm ldid
 
       - name: YouTube
         env:
@@ -102,7 +112,7 @@ jobs:
             curl --fail --location "$IPA_URL" --output YouTube.ipa
           fi
           if [[ -n "${IPA_SHA256:-}" ]]; then
-            echo "${IPA_SHA256}  YouTube.ipa" | shasum -a 256 -c -
+            echo "${IPA_SHA256}  YouTube.ipa" | sha256sum -c -
           else
             echo "::warning::No SHA-256 provided for this IPA; skipping integrity check."
           fi
@@ -118,7 +128,7 @@ jobs:
         run: |
           mkdir deb-root
           dpkg-deb -x packages/*.deb deb-root
-          export LDID="$(brew --prefix)/bin/ldid"
+          export LDID=/usr/local/bin/ldid
           tweak_version="$(awk '/^Version:/ {print $2}' control)"
           youtube_version="$(python3 - <<'PY'
           import plistlib
