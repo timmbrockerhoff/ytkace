@@ -3,8 +3,11 @@
 #import "../../Runtime/Preferences.h"
 
 #import <UIKit/UIKit.h>
+#import <CommonCrypto/CommonDigest.h>
+#import <ImageIO/ImageIO.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <math.h>
 #import <os/lock.h>
 #import <stdatomic.h>
 
@@ -22,6 +25,10 @@ static const NSUInteger YTKACECellTextDepth = 10;
 static const NSUInteger YTKACEMaxCellText = 10;
 static const NSTimeInterval YTKACENegativeTTL = 7 * 24 * 60 * 60;
 static const NSInteger YTKACEStoreVersion = 2;
+static const NSTimeInterval YTKACEPersistDelay = 5.0;
+static const NSUInteger YTKACEThumbMaxPixels = 720;
+static const NSUInteger YTKACEImageCacheBytes = 40 * 1024 * 1024;
+static const NSUInteger YTKACEMaxBrandingResponse = 4 * 1024 * 1024;
 
 static IMP OriginalDownloadImage;
 static IMP OriginalCachedImage;
@@ -41,12 +48,25 @@ static NSMapTable *YTKACEPendingNodes;
 static NSMapTable *YTKACEPendingCells;
 static NSMutableDictionary<NSString *, NSDictionary *> *YTKACEStore;
 static NSCache<NSString *, UIImage *> *YTKACEImageCache;
+static BOOL YTKACEPersistPending;
 
 static atomic_int YTKACEModeCache = -1;
 static atomic_int YTKACETitlesCache = -1;
 
 static void YTKACEPumpQueue(void);
 static void YTKACEApplyTitleToCell(id root, NSString *videoID);
+
+// JSON values may be NSNull or an unexpected type after a server change;
+// never send them boolValue/integerValue blindly.
+static BOOL YTKACEJSONBool(id value) {
+    return ([value isKindOfClass:NSNumber.class] || [value isKindOfClass:NSString.class]) &&
+        [value boolValue];
+}
+
+static NSInteger YTKACEJSONInteger(id value) {
+    return [value isKindOfClass:NSNumber.class] || [value isKindOfClass:NSString.class]
+        ? [value integerValue] : 0;
+}
 
 static NSInteger YTKACEThumbMode(void) {
     int cached = atomic_load(&YTKACEModeCache);
@@ -144,10 +164,18 @@ static void YTKACELoadStore(void) {
     if (YTKACEStore != nil) return;
     NSDictionary *stored =
         [NSUserDefaults.standardUserDefaults dictionaryForKey:YTKACEBrandingStoreKey];
-    YTKACEStore = [stored isKindOfClass:NSDictionary.class]
-        ? [stored mutableCopy] : [NSMutableDictionary dictionary];
+    YTKACEStore = [NSMutableDictionary dictionaryWithCapacity:stored.count];
+    if ([stored isKindOfClass:NSDictionary.class]) {
+        [stored enumerateKeysAndObjectsUsingBlock:^(id key, id entry, __unused BOOL *stop) {
+            if ([key isKindOfClass:NSString.class] && [entry isKindOfClass:NSDictionary.class]) {
+                YTKACEStore[key] = entry;
+            }
+        }];
+    }
+    // Decoded thumbnails are bounded by bytes (cost), not just by count.
     YTKACEImageCache = [NSCache new];
     YTKACEImageCache.countLimit = 160;
+    YTKACEImageCache.totalCostLimit = YTKACEImageCacheBytes;
     YTKACEInFlight = [NSMutableSet set];
     YTKACEThumbInFlight = [NSMutableSet set];
     YTKACEPendingIDs = [NSMutableArray array];
@@ -172,8 +200,21 @@ static void YTKACEEvictLocked(void) {
     }
 }
 
-static void YTKACEPersistStore(void) {
+static dispatch_queue_t YTKACEPersistQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("ytkace.dearrow.persist",
+            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+                                                    QOS_CLASS_UTILITY, 0));
+    });
+    return queue;
+}
+
+// Runs on YTKACEPersistQueue only.
+static void YTKACEPersistStoreNow(void) {
     os_unfair_lock_lock(&YTKACELock);
+    YTKACEPersistPending = NO;
     YTKACEEvictLocked();
     NSDictionary *snapshot = [YTKACEStore copy];
     os_unfair_lock_unlock(&YTKACELock);
@@ -183,15 +224,48 @@ static void YTKACEPersistStore(void) {
     }
 }
 
+// Writing the whole ~800-entry store on every branding response is costly;
+// coalesce writes to at most one per YTKACEPersistDelay (plus a flush when
+// the app goes to the background).
+static void YTKACESchedulePersist(void) {
+    os_unfair_lock_lock(&YTKACELock);
+    BOOL schedule = !YTKACEPersistPending;
+    YTKACEPersistPending = YES;
+    os_unfair_lock_unlock(&YTKACELock);
+    if (!schedule) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(YTKACEPersistDelay * NSEC_PER_SEC)),
+                   YTKACEPersistQueue(), ^{
+        os_unfair_lock_lock(&YTKACELock);
+        BOOL pending = YTKACEPersistPending;
+        os_unfair_lock_unlock(&YTKACELock);
+        if (pending) YTKACEPersistStoreNow();
+    });
+}
+
+static void YTKACEFlushStore(void) {
+    os_unfair_lock_lock(&YTKACELock);
+    BOOL pending = YTKACEPersistPending;
+    os_unfair_lock_unlock(&YTKACELock);
+    if (!pending) return;
+    dispatch_sync(YTKACEPersistQueue(), ^{
+        os_unfair_lock_lock(&YTKACELock);
+        BOOL stillPending = YTKACEPersistPending;
+        os_unfair_lock_unlock(&YTKACELock);
+        if (stillPending) YTKACEPersistStoreNow();
+    });
+}
+
 static NSDictionary *YTKACEFreshEntryLocked(NSString *videoID) {
     NSDictionary *entry = YTKACEStore[videoID];
     if (entry == nil) return nil;
-    if ([entry[@"v"] integerValue] < YTKACEStoreVersion) {
+    if (![entry isKindOfClass:NSDictionary.class] ||
+        YTKACEJSONInteger(entry[@"v"]) < YTKACEStoreVersion) {
         [YTKACEStore removeObjectForKey:videoID];
         return nil;
     }
     if (entry[@"t"] != nil || entry[@"ti"] != nil) return entry;
-    double added = [entry[@"a"] doubleValue];
+    id addedValue = entry[@"a"];
+    double added = [addedValue isKindOfClass:NSNumber.class] ? [addedValue doubleValue] : 0.0;
     if (NSDate.date.timeIntervalSince1970 - added > YTKACENegativeTTL) {
         [YTKACEStore removeObjectForKey:videoID];
         return nil;
@@ -213,7 +287,7 @@ static void YTKACEStoreBranding(NSString *videoID, NSNumber *timestamp,
     [YTKACEInFlight removeObject:videoID];
     if (YTKACEActiveRequests > 0) YTKACEActiveRequests--;
     os_unfair_lock_unlock(&YTKACELock);
-    YTKACEPersistStore();
+    YTKACESchedulePersist();
     YTKACEPumpQueue();
 }
 
@@ -237,6 +311,27 @@ static void YTKACEApplyImage(id node, NSString *videoID, UIImage *image) {
         } @catch (__unused NSException *exception) {
         }
     });
+}
+
+// Decode once, off the main thread, at roughly display size. Full-resolution
+// frames from the thumbnail server would otherwise sit decoded in the cache.
+static UIImage *YTKACEDecodeThumbnail(NSData *data, NSUInteger *cost) {
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    if (source == NULL) return nil;
+    NSDictionary *options = @{
+        (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+        (id)kCGImageSourceCreateThumbnailWithTransform: @YES,
+        (id)kCGImageSourceShouldCacheImmediately: @YES,
+        (id)kCGImageSourceThumbnailMaxPixelSize: @(YTKACEThumbMaxPixels)
+    };
+    CGImageRef image =
+        CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)options);
+    CFRelease(source);
+    if (image == NULL) return nil;
+    *cost = CGImageGetBytesPerRow(image) * CGImageGetHeight(image);
+    UIImage *result = [UIImage imageWithCGImage:image];
+    CGImageRelease(image);
+    return result;
 }
 
 static void YTKACEFetchThumbnail(NSString *videoID, double timestamp, id node) {
@@ -267,11 +362,12 @@ static void YTKACEFetchThumbnail(NSString *videoID, double timestamp, id node) {
         os_unfair_lock_unlock(&YTKACELock);
         NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class]
             ? (NSHTTPURLResponse *)response : nil;
+        NSUInteger cost = 0;
         UIImage *decoded = (error == nil && http.statusCode == 200 && data.length != 0)
-            ? [UIImage imageWithData:data] : nil;
+            ? YTKACEDecodeThumbnail(data, &cost) : nil;
         if (decoded == nil) return;
         os_unfair_lock_lock(&YTKACELock);
-        [YTKACEImageCache setObject:decoded forKey:videoID];
+        [YTKACEImageCache setObject:decoded forKey:videoID cost:cost];
         os_unfair_lock_unlock(&YTKACELock);
         YTKACEApplyImage(weakNode, videoID, decoded);
     }] resume];
@@ -369,11 +465,83 @@ static BOOL YTKACEClaimSlotLocked(void) {
     return YES;
 }
 
-static void YTKACEFetchBranding(NSString *videoID, id node) {
-    NSString *address = [NSString stringWithFormat:
-        @"https://sponsor.ajay.app/api/branding?videoID=%@", videoID];
+static void YTKACEReleaseBrandingSlot(NSString *videoID) {
+    os_unfair_lock_lock(&YTKACELock);
+    [YTKACEInFlight removeObject:videoID];
+    if (YTKACEActiveRequests > 0) YTKACEActiveRequests--;
+    os_unfair_lock_unlock(&YTKACELock);
+    YTKACEPumpQueue();
+}
+
+static void YTKACEHandleBranding(NSString *videoID, NSDictionary *payload, id node) {
+    if (![payload isKindOfClass:NSDictionary.class]) {
+        YTKACEStoreBranding(videoID, nil, nil);
+        return;
+    }
+    NSArray *titles = [payload[@"titles"] isKindOfClass:NSArray.class]
+        ? payload[@"titles"] : @[];
+    NSArray *thumbnails = [payload[@"thumbnails"] isKindOfClass:NSArray.class]
+        ? payload[@"thumbnails"] : @[];
+
+    NSString *useTitle = nil;
+    NSDictionary *bestTitle = titles.firstObject;
+    if ([bestTitle isKindOfClass:NSDictionary.class]) {
+        BOOL trusted = YTKACEJSONBool(bestTitle[@"locked"]) ||
+            YTKACEJSONInteger(bestTitle[@"votes"]) >= 0;
+        id text = bestTitle[@"title"];
+        if (trusted && !YTKACEJSONBool(bestTitle[@"original"]) &&
+            [text isKindOfClass:NSString.class]) {
+            NSString *cleaned = [(NSString *)text
+                stringByReplacingOccurrencesOfString:@">" withString:@""];
+            cleaned = [cleaned stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (cleaned.length != 0) useTitle = cleaned;
+        }
+    }
+
+    NSNumber *useTimestamp = nil;
+    NSDictionary *bestThumb = thumbnails.firstObject;
+    if ([bestThumb isKindOfClass:NSDictionary.class]) {
+        BOOL trusted = YTKACEJSONBool(bestThumb[@"locked"]) ||
+            YTKACEJSONInteger(bestThumb[@"votes"]) >= 0;
+        id timestamp = bestThumb[@"timestamp"];
+        if (trusted && !YTKACEJSONBool(bestThumb[@"original"]) &&
+            [timestamp isKindOfClass:NSNumber.class] &&
+            isfinite([timestamp doubleValue])) {
+            useTimestamp = timestamp;
+        }
+    }
+
+    YTKACEStoreBranding(videoID, useTimestamp, useTitle);
+    if (useTitle.length != 0) YTKACEApplyPendingTitle(videoID);
+    if (useTimestamp != nil) {
+        YTKACEFetchThumbnail(videoID, useTimestamp.doubleValue, node);
+    }
+}
+
+// First 4 hex characters of sha256(videoID), for the k-anonymity endpoint.
+static NSString *YTKACEBrandingHashPrefix(NSString *videoID) {
+    NSData *data = [videoID dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    return [NSString stringWithFormat:@"%02x%02x", digest[0], digest[1]];
+}
+
+// The caller has claimed a request slot and marked videoID in flight; every
+// path below must end in YTKACEStoreBranding or YTKACEReleaseBrandingSlot.
+static void YTKACEFetchBranding(NSString *videoID, id node, BOOL legacy) {
+    // Default: hash-prefix lookup so the server never learns the exact video.
+    // The response is a dictionary keyed by videoID for all videos sharing the
+    // prefix. The full-ID endpoint is only a fallback for an unexpected reply.
+    NSString *address = legacy
+        ? [NSString stringWithFormat:@"https://sponsor.ajay.app/api/branding?videoID=%@", videoID]
+        : [NSString stringWithFormat:@"https://sponsor.ajay.app/api/branding/%@",
+              YTKACEBrandingHashPrefix(videoID)];
     NSURL *URL = [NSURL URLWithString:address];
-    if (URL == nil) return;
+    if (URL == nil) {
+        YTKACEReleaseBrandingSlot(videoID);
+        return;
+    }
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:URL];
     request.timeoutInterval = 15.0;
     [request setValue:@"application/json" forHTTPHeaderField:@"Accept"];
@@ -383,58 +551,30 @@ static void YTKACEFetchBranding(NSString *videoID, id node) {
         NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class]
             ? (NSHTTPURLResponse *)response : nil;
         if (error != nil) {
-            os_unfair_lock_lock(&YTKACELock);
-            [YTKACEInFlight removeObject:videoID];
-            if (YTKACEActiveRequests > 0) YTKACEActiveRequests--;
-            os_unfair_lock_unlock(&YTKACELock);
-            YTKACEPumpQueue();
+            YTKACEReleaseBrandingSlot(videoID);
             return;
         }
-        id json = (http.statusCode == 200 && data.length != 0)
+        NSInteger status = http.statusCode;
+        id json = (status == 200 && data.length != 0 &&
+                   data.length <= YTKACEMaxBrandingResponse)
             ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-        if (![json isKindOfClass:NSDictionary.class]) {
-            YTKACEStoreBranding(videoID, nil, nil);
+        if (legacy) {
+            YTKACEHandleBranding(videoID, json, weakNode);
             return;
         }
-        NSDictionary *payload = json;
-        NSArray *titles = [payload[@"titles"] isKindOfClass:NSArray.class]
-            ? payload[@"titles"] : @[];
-        NSArray *thumbnails = [payload[@"thumbnails"] isKindOfClass:NSArray.class]
-            ? payload[@"thumbnails"] : @[];
-
-        NSString *useTitle = nil;
-        NSDictionary *bestTitle = titles.firstObject;
-        if ([bestTitle isKindOfClass:NSDictionary.class]) {
-            BOOL trusted = [bestTitle[@"locked"] boolValue] ||
-                [bestTitle[@"votes"] integerValue] >= 0;
-            id text = bestTitle[@"title"];
-            if (trusted && ![bestTitle[@"original"] boolValue] &&
-                [text isKindOfClass:NSString.class]) {
-                NSString *cleaned = [(NSString *)text
-                    stringByReplacingOccurrencesOfString:@">" withString:@""];
-                cleaned = [cleaned stringByTrimmingCharactersInSet:
-                    NSCharacterSet.whitespaceAndNewlineCharacterSet];
-                if (cleaned.length != 0) useTitle = cleaned;
+        if ([json isKindOfClass:NSDictionary.class]) {
+            NSDictionary *payload = json[videoID];
+            if (payload == nil && [json[@"titles"] isKindOfClass:NSArray.class]) {
+                payload = json; // single-video shape
             }
+            YTKACEHandleBranding(videoID, payload, weakNode);
+            return;
         }
-
-        NSNumber *useTimestamp = nil;
-        NSDictionary *bestThumb = thumbnails.firstObject;
-        if ([bestThumb isKindOfClass:NSDictionary.class]) {
-            BOOL trusted = [bestThumb[@"locked"] boolValue] ||
-                [bestThumb[@"votes"] integerValue] >= 0;
-            id timestamp = bestThumb[@"timestamp"];
-            if (trusted && ![bestThumb[@"original"] boolValue] &&
-                [timestamp isKindOfClass:NSNumber.class]) {
-                useTimestamp = timestamp;
-            }
+        if (status == 400 || (status == 200 && json != nil)) {
+            YTKACEFetchBranding(videoID, weakNode, YES);
+            return;
         }
-
-        YTKACEStoreBranding(videoID, useTimestamp, useTitle);
-        if (useTitle.length != 0) YTKACEApplyPendingTitle(videoID);
-        if (useTimestamp != nil) {
-            YTKACEFetchThumbnail(videoID, useTimestamp.doubleValue, weakNode);
-        }
+        YTKACEHandleBranding(videoID, nil, weakNode);
     }] resume];
 }
 
@@ -462,7 +602,7 @@ static void YTKACEPumpQueue(void) {
         }
         os_unfair_lock_unlock(&YTKACELock);
         if (videoID == nil) return;
-        YTKACEFetchBranding(videoID, node);
+        YTKACEFetchBranding(videoID, node, NO);
     }
 }
 
@@ -554,8 +694,13 @@ void YTKACEDeArrowClearCache(void) {
     [YTKACEImageCache removeAllObjects];
     [YTKACEPendingIDs removeAllObjects];
     [YTKACEPendingCells removeAllObjects];
+    YTKACEPersistPending = NO;
     os_unfair_lock_unlock(&YTKACELock);
-    [NSUserDefaults.standardUserDefaults removeObjectForKey:YTKACEBrandingStoreKey];
+    // Serialize with any in-progress write so an older snapshot can't land
+    // after the removal.
+    dispatch_async(YTKACEPersistQueue(), ^{
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:YTKACEBrandingStoreKey];
+    });
 }
 
 void YTKACEInstallDeArrow(void) {
@@ -579,5 +724,11 @@ void YTKACEInstallDeArrow(void) {
                 usingBlock:^(__unused NSNotification *note) {
         atomic_store(&YTKACEModeCache, -1);
         atomic_store(&YTKACETitlesCache, -1);
+    }];
+    [NSNotificationCenter.defaultCenter
+        addObserverForName:UIApplicationDidEnterBackgroundNotification
+                    object:nil queue:nil
+                usingBlock:^(__unused NSNotification *note) {
+        YTKACEFlushStore();
     }];
 }
