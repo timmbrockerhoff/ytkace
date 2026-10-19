@@ -123,7 +123,7 @@ static NSString *YTKACEActionPreference(id item) {
     return nil;
 }
 
-static BOOL YTKACEAnyActionPreferenceEnabled(void) {
+static BOOL YTKACEComputeAnyActionPreferenceEnabled(void) {
     for (NSString *key in @[
         @"YTKACE.Preference.ActionBar.LikeHidden",
         @"YTKACE.Preference.ActionBar.DislikeHidden",
@@ -141,6 +141,20 @@ static BOOL YTKACEAnyActionPreferenceEnabled(void) {
         if (YTKACEFeatureEnabled(key)) return YES;
     }
     return NO;
+}
+
+// Called from layout hooks on every frame while scrolling; the answer only
+// changes when a preference changes, so cache it per preference generation.
+static _Atomic(uint64_t) YTKACEAnyActionPreferenceCache = 0;
+
+static BOOL YTKACEAnyActionPreferenceEnabled(void) {
+    uint64_t generation = YTKACEPreferenceGeneration();
+    uint64_t cached = atomic_load(&YTKACEAnyActionPreferenceCache);
+    if (cached != 0 && (cached >> 1) == generation) return (cached & 1) != 0;
+    BOOL enabled = YTKACEComputeAnyActionPreferenceEnabled();
+    atomic_store(&YTKACEAnyActionPreferenceCache,
+                 (generation << 1) | (enabled ? 1 : 0));
+    return enabled;
 }
 
 static NSString *YTKACEActionPreferenceForView(UIView *view) {
@@ -398,7 +412,6 @@ static NSArray<NSString *> *YTKACEControllerButtonIdentifiers(id controller) {
 }
 
 static BOOL YTKACEControllerCellCollapsed(id receiver) {
-    static NSUInteger logged = 0;
     NSString *preference = YTKACEActionPreferenceForController(receiver);
     NSArray<NSString *> *identifiers = YTKACEControllerButtonIdentifiers(receiver);
     BOOL collapsed = preference.length != 0 && YTKACEFeatureEnabled(preference);
@@ -411,9 +424,6 @@ static BOOL YTKACEControllerCellCollapsed(id receiver) {
                 break;
             }
         }
-    }
-    if (logged < 60) {
-        logged++;
     }
     return collapsed;
 }
@@ -559,9 +569,9 @@ static void YTKACEASCollectionViewLayout(UICollectionView *receiver,
     if (OriginalASCollectionViewLayout != NULL) {
         ((void (*)(id, SEL))OriginalASCollectionViewLayout)(receiver, selector);
     }
-    if (!YTKACEAnyActionPreferenceEnabled() || receiver.window == nil) return;
     CGFloat height = CGRectGetHeight(receiver.bounds);
     if (height < 36.0 || height > 68.0) return;
+    if (receiver.window == nil || !YTKACEAnyActionPreferenceEnabled()) return;
 
     NSArray<UICollectionViewCell *> *visible = [receiver.visibleCells
         sortedArrayUsingComparator:^NSComparisonResult(UICollectionViewCell *left,
@@ -579,15 +589,10 @@ static void YTKACEASCollectionViewLayout(UICollectionView *receiver,
         }];
     if (visible.count == 0) return;
 
-    static NSUInteger layoutLogged = 0;
     CGFloat removedWidth = 0.0;
     NSUInteger matchedCells = 0;
     for (UICollectionViewCell *cell in visible) {
         CGRect frame = cell.frame;
-        NSArray<NSString *> *cellButtons = YTKACEActionButtonIdentifiers(cell);
-        if (layoutLogged < 80 && cellButtons.count != 0) {
-            layoutLogged++;
-        }
         frame.origin.x -= removedWidth;
         NSSet<NSString *> *preferences = YTKACEActionPreferencesInCell(cell);
         if (preferences.count != 0) {
@@ -612,9 +617,6 @@ static void YTKACEASCollectionViewLayout(UICollectionView *receiver,
                     newWidth = 0.0;
                 } else if (trailingOnly) {
                     newWidth = floor(MAX(0.0, oldWidth - measuredTotal));
-                }
-                if (layoutLogged < 80) {
-                    layoutLogged++;
                 }
                 removedWidth += oldWidth - newWidth;
                 frame.size.width = newWidth;
@@ -651,21 +653,32 @@ static BOOL YTKACEEnsureActionCollectionLayoutHook(void) {
     return NO;
 }
 
+static BOOL YTKACEStructuralActionHooksInstalled(void) {
+    BOOL structural = YTKACEEnsureStructuralActionHook();
+    BOOL controller = YTKACEEnsureActionCellControllerHooks();
+    BOOL collection = YTKACEEnsureActionCollectionLayoutHook();
+    return structural && controller && collection;
+}
+
+static void YTKACEScheduleStructuralActionHookAttempt(NSUInteger index) {
+    static const double delays[] = {0.0, 0.5, 1.5, 3.0, 6.0, 9.0, 12.0, 18.0};
+    static const NSUInteger count = sizeof(delays) / sizeof(delays[0]);
+    if (index >= count) return;
+    double wait = delays[index] - (index == 0 ? 0.0 : delays[index - 1]);
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
+        dispatch_get_main_queue(),
+        ^{
+            // Stop retrying as soon as every hook is in place.
+            if (YTKACEStructuralActionHooksInstalled()) return;
+            YTKACEScheduleStructuralActionHookAttempt(index + 1);
+        }
+    );
+}
+
 static void YTKACEScheduleStructuralActionHook(void) {
-    NSArray<NSNumber *> *delays =
-        @[@0.0, @0.5, @1.5, @3.0, @6.0, @9.0, @12.0, @18.0];
-    for (NSNumber *delay in delays) {
-        dispatch_after(
-            dispatch_time(DISPATCH_TIME_NOW,
-                          (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
-            dispatch_get_main_queue(),
-            ^{
-                YTKACEEnsureStructuralActionHook();
-                YTKACEEnsureActionCellControllerHooks();
-                YTKACEEnsureActionCollectionLayoutHook();
-            }
-        );
-    }
+    if (YTKACEStructuralActionHooksInstalled()) return;
+    YTKACEScheduleStructuralActionHookAttempt(0);
 }
 
 static UICollectionView *YTKACEActionCollectionView(UIView *view) {
@@ -817,15 +830,10 @@ static void YTKACEFixedBarLayoutSubviews(UIView *receiver, SEL selector) {
     if (barWidth <= 0.0) return;
     CGFloat naturalSlot = barWidth / (CGFloat)slots.count;
     NSMutableArray<UIView *> *keep = [NSMutableArray array];
-    NSMutableArray<NSString *> *trace = [NSMutableArray array];
     for (UIView *slot in slots) {
         NSString *preference = YTKACEBarSlotPreference(slot);
         BOOL hidden = preference.length != 0 &&
             YTKACEFeatureEnabled(preference);
-        [trace addObject:[NSString stringWithFormat:@"%@%@",
-            preference.length == 0 ? @"-"
-                : [preference componentsSeparatedByString:@"."].lastObject,
-            hidden ? @"!" : @""]];
         if (!hidden) [keep addObject:slot];
     }
     if (keep.count == 0 || keep.count == slots.count) return;
@@ -839,12 +847,6 @@ static void YTKACEFixedBarLayoutSubviews(UIView *receiver, SEL selector) {
             (share - naturalSlot) / 2.0;
         slot.frame = frame;
         position++;
-    }
-
-    static NSTimeInterval lastLog = 0.0;
-    NSTimeInterval now = NSDate.timeIntervalSinceReferenceDate;
-    if (now - lastLog > 2.0) {
-        lastLog = now;
     }
 }
 
