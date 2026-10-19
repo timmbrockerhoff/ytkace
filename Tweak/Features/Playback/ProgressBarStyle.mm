@@ -44,6 +44,34 @@ static NSMutableDictionary<NSString *, UIColor *> *YTKACEColorCache = nil;
 static NSUInteger YTKACEProgressGeneration = 0;
 static NSUInteger YTKACECachedGeneration = NSUIntegerMax;
 
+// The thumbnail setImage: hook runs on Texture's image queues while the
+// layout hooks run on main, and both read and write these caches. Unlocked
+// NSMutableDictionary access from two threads crashes, so every cache access
+// goes through these helpers.
+static NSObject *YTKACEProgressCacheLock(void) {
+    static NSObject *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
+static id YTKACECacheGet(NSMutableDictionary *__strong *cache, NSString *key) {
+    if (key == nil) return nil;
+    @synchronized (YTKACEProgressCacheLock()) {
+        return (*cache)[key];
+    }
+}
+
+static void YTKACECacheSet(NSMutableDictionary *__strong *cache, NSString *key,
+                           id value, NSUInteger limit) {
+    if (key == nil || value == nil) return;
+    @synchronized (YTKACEProgressCacheLock()) {
+        if (*cache == nil) *cache = [NSMutableDictionary dictionary];
+        if ((*cache).count > limit) [*cache removeAllObjects];
+        (*cache)[key] = value;
+    }
+}
+
 static void YTKACERelayoutBars(UIView *view, NSUInteger depth) {
     if (view == nil || depth > 14) return;
     NSString *name = NSStringFromClass(view.class);
@@ -78,12 +106,14 @@ static void YTKACEProgressSyncGeneration(void) {
             }
         }];
     });
-    if (YTKACECachedGeneration == YTKACEProgressGeneration) return;
-    YTKACECachedGeneration = YTKACEProgressGeneration;
-    YTKACEStyleCache = -1;
-    YTKACEColorCache = nil;
-    YTKACEPatternCache = nil;
-    YTKACEStripCache = nil;
+    @synchronized (YTKACEProgressCacheLock()) {
+        if (YTKACECachedGeneration == YTKACEProgressGeneration) return;
+        YTKACECachedGeneration = YTKACEProgressGeneration;
+        YTKACEStyleCache = -1;
+        YTKACEColorCache = nil;
+        YTKACEPatternCache = nil;
+        YTKACEStripCache = nil;
+    }
 }
 
 static NSInteger YTKACEProgressStyle(void) {
@@ -97,11 +127,10 @@ static NSInteger YTKACEProgressStyle(void) {
 
 static UIColor *YTKACEStoredColor(NSString *key, UIColor *fallback) {
     YTKACEProgressSyncGeneration();
-    UIColor *hit = YTKACEColorCache[key];
+    UIColor *hit = YTKACECacheGet(&YTKACEColorCache, key);
     if (hit != nil) return hit;
     UIColor *value = YTKACEProgressColorFromHex(YTKACEPreferenceObject(key), fallback);
-    if (YTKACEColorCache == nil) YTKACEColorCache = [NSMutableDictionary dictionary];
-    if (value != nil) YTKACEColorCache[key] = value;
+    YTKACECacheSet(&YTKACEColorCache, key, value, 64);
     return value;
 }
 
@@ -141,7 +170,7 @@ static UIImage *YTKACEGradientStrip(CGFloat width, CGFloat height) {
     UIColor *highlight = YTKACEStoredColor(YTKACEProgressGradientColorKey, main);
     NSString *stripKey = [NSString stringWithFormat:@"%.0f|%.0f|%@|%@",
                           width, height, main, highlight];
-    UIImage *cachedStrip = YTKACEStripCache[stripKey];
+    UIImage *cachedStrip = YTKACECacheGet(&YTKACEStripCache, stripKey);
     if (cachedStrip != nil) return cachedStrip;
     CGSize size = CGSizeMake(MAX(width, 1.0), MAX(height, 1.0));
     UIGraphicsImageRenderer *renderer =
@@ -157,9 +186,7 @@ static UIImage *YTKACEGradientStrip(CGFloat width, CGFloat height) {
         CGGradientRelease(gradient);
         CGColorSpaceRelease(space);
     }];
-    if (YTKACEStripCache == nil) YTKACEStripCache = [NSMutableDictionary dictionary];
-    if (YTKACEStripCache.count > 24) [YTKACEStripCache removeAllObjects];
-    YTKACEStripCache[stripKey] = strip;
+    YTKACECacheSet(&YTKACEStripCache, stripKey, strip, 24);
     return strip;
 }
 
@@ -182,7 +209,7 @@ UIImage *YTKACEProgressFillImage(CGFloat width, CGFloat height) {
     }
     NSString *key = [NSString stringWithFormat:@"fill|%.0f|%.0f|%ld|%@|%@",
                      size.width, size.height, (long)style, start, end];
-    UIImage *cached = YTKACEStripCache[key];
+    UIImage *cached = YTKACECacheGet(&YTKACEStripCache, key);
     if (cached != nil) return cached;
     UIGraphicsImageRenderer *renderer =
         [[UIGraphicsImageRenderer alloc] initWithSize:size];
@@ -198,9 +225,7 @@ UIImage *YTKACEProgressFillImage(CGFloat width, CGFloat height) {
         CGGradientRelease(gradient);
         CGColorSpaceRelease(space);
     }];
-    if (YTKACEStripCache == nil) YTKACEStripCache = [NSMutableDictionary dictionary];
-    if (YTKACEStripCache.count > 40) [YTKACEStripCache removeAllObjects];
-    YTKACEStripCache[key] = image;
+    YTKACECacheSet(&YTKACEStripCache, key, image, 40);
     return image;
 }
 
@@ -233,7 +258,7 @@ static UIColor *YTKACEPlayedColorForView(id receiver) {
 
     NSString *patternKey = [NSString stringWithFormat:@"%.0f|%.0f|%.0f|%.0f",
                             offset, viewWidth, height, barWidth];
-    UIColor *cachedPattern = YTKACEPatternCache[patternKey];
+    UIColor *cachedPattern = YTKACECacheGet(&YTKACEPatternCache, patternKey);
     if (cachedPattern != nil) return cachedPattern;
     CGFloat scale = UIScreen.mainScreen.scale;
     UIImage *full = YTKACEGradientStrip(barWidth, height);
@@ -246,9 +271,7 @@ static UIColor *YTKACEPlayedColorForView(id receiver) {
                                   orientation:UIImageOrientationUp];
     CGImageRelease(slice);
     UIColor *pattern = [UIColor colorWithPatternImage:tile];
-    if (YTKACEPatternCache == nil) YTKACEPatternCache = [NSMutableDictionary dictionary];
-    if (YTKACEPatternCache.count > 96) [YTKACEPatternCache removeAllObjects];
-    YTKACEPatternCache[patternKey] = pattern;
+    YTKACECacheSet(&YTKACEPatternCache, patternKey, pattern, 96);
     return pattern;
 }
 
@@ -590,7 +613,7 @@ static UIImage *YTKACEThumbBarImage(CGFloat width, CGFloat height,
                               width, height, trackWidth, YTKACEMainColor(),
                               YTKACEStoredColor(YTKACEProgressGradientColorKey,
                                                 YTKACEMainColor())];
-        UIImage *cachedSlice = YTKACEStripCache[sliceKey];
+        UIImage *cachedSlice = YTKACECacheGet(&YTKACEStripCache, sliceKey);
         if (cachedSlice != nil) return cachedSlice;
         UIImage *full = YTKACEGradientStrip(trackWidth, height);
         CGFloat scale = full.scale;
@@ -601,17 +624,15 @@ static UIImage *YTKACEThumbBarImage(CGFloat width, CGFloat height,
                                              scale:scale
                                        orientation:UIImageOrientationUp];
         CGImageRelease(cropped);
-        if (YTKACEStripCache == nil) YTKACEStripCache = [NSMutableDictionary dictionary];
-        if (YTKACEStripCache.count > 24) [YTKACEStripCache removeAllObjects];
         objc_setAssociatedObject(slice, YTKACEThumbGeneratedAssociation, @YES,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        YTKACEStripCache[sliceKey] = slice;
+        YTKACECacheSet(&YTKACEStripCache, sliceKey, slice, 24);
         return slice;
     }
     UIColor *main = YTKACEMainColor();
     NSString *key = [NSString stringWithFormat:@"solid|%.0f|%.0f|%@",
                      width, height, main];
-    UIImage *cached = YTKACEStripCache[key];
+    UIImage *cached = YTKACECacheGet(&YTKACEStripCache, key);
     if (cached != nil) return cached;
     CGSize size = CGSizeMake(MAX(width, 1.0), MAX(height, 1.0));
     UIGraphicsImageRenderer *renderer =
@@ -624,11 +645,9 @@ static UIImage *YTKACEThumbBarImage(CGFloat width, CGFloat height,
                                     cornerRadius:size.height / 2.0] fill];
         (void)context;
     }];
-    if (YTKACEStripCache == nil) YTKACEStripCache = [NSMutableDictionary dictionary];
-    if (YTKACEStripCache.count > 24) [YTKACEStripCache removeAllObjects];
     objc_setAssociatedObject(image, YTKACEThumbGeneratedAssociation, @YES,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    YTKACEStripCache[key] = image;
+    YTKACECacheSet(&YTKACEStripCache, key, image, 24);
     return image;
 }
 

@@ -81,7 +81,7 @@ static BOOL YTKACECaptionRequestReceiver(id receiver, SEL selector) {
         [name containsString:@"hiddenonstart"];
 }
 
-static IMP YTKACEMiscOriginal(id receiver, SEL selector) {
+static IMP YTKACEMiscOriginal(id receiver, SEL selector, NSUInteger skip) {
     IMP original = NULL;
     os_unfair_lock_lock(&YTKACEMiscOriginalsLock);
     if (YTKACEMiscOriginals != NULL) {
@@ -90,8 +90,13 @@ static IMP YTKACEMiscOriginal(id receiver, SEL selector) {
             CFDictionaryRef selectors = (CFDictionaryRef)
                 CFDictionaryGetValue(YTKACEMiscOriginals, (__bridge void *)cls);
             if (selectors == NULL) continue;
-            original = (IMP)CFDictionaryGetValue(selectors, selector);
-            if (original != NULL) break;
+            IMP candidate = (IMP)CFDictionaryGetValue(selectors, selector);
+            if (candidate == NULL) continue;
+            if (skip == 0) {
+                original = candidate;
+                break;
+            }
+            skip--;
         }
     }
     os_unfair_lock_unlock(&YTKACEMiscOriginalsLock);
@@ -241,7 +246,8 @@ static BOOL YTKACEMiniPlayerValue(id receiver, SEL selector) {
                  [name containsString:@"hide"] ||
                  [name containsString:@"onlywhenplaying"]);
     }
-    IMP original = YTKACEMiscOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
     return original != NULL ? ((BOOL (*)(id, SEL))original)(receiver, selector) : NO;
 }
 
@@ -249,7 +255,8 @@ static BOOL YTKACEMiniPlayerPauseOnlyValue(id receiver, SEL selector) {
     if (YTKACEMiniPlayerEnabled()) {
         return NO;
     }
-    IMP original = YTKACEMiscOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
     return original != NULL ? ((BOOL (*)(id, SEL))original)(receiver, selector) : NO;
 }
 
@@ -259,7 +266,8 @@ static BOOL YTKACEAgeValue(id receiver, SEL selector) {
         return [name containsString:@"verified"] ||
             [name containsString:@"allowed"];
     }
-    IMP original = YTKACEMiscOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
     return original != NULL ? ((BOOL (*)(id, SEL))original)(receiver, selector) : NO;
 }
 
@@ -281,7 +289,8 @@ static BOOL YTKACECaptionValue(id receiver, SEL selector) {
     }
     if ((YTKACECaptionsMode() == 1)) {
         if (!YTKACECaptionRequestReceiver(receiver, selector)) {
-            IMP original = YTKACEMiscOriginal(receiver, selector);
+            YTKACEOriginalScope originalScope(receiver, selector);
+            IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
             return original != NULL
                 ? ((BOOL (*)(id, SEL))original)(receiver, selector) : NO;
         }
@@ -291,12 +300,14 @@ static BOOL YTKACECaptionValue(id receiver, SEL selector) {
         }
         return !negative;
     }
-    IMP original = YTKACEMiscOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
     return original != NULL ? ((BOOL (*)(id, SEL))original)(receiver, selector) : NO;
 }
 
 static void YTKACECaptionSetter(id receiver, SEL selector, BOOL enabled) {
-    IMP original = YTKACEMiscOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
     if (original == NULL) {
         return;
     }
@@ -420,7 +431,8 @@ static id YTKACECaptionControllerAlloc(id receiver, SEL selector, NSZone *zone) 
 }
 
 static id YTKACECaptionControllerInit(id receiver, SEL selector) {
-    IMP original = YTKACEMiscOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
     id result = original != NULL
         ? ((id (*)(id, SEL))original)(receiver, selector) : receiver;
     if (result != nil) {
@@ -432,16 +444,24 @@ static id YTKACECaptionControllerInit(id receiver, SEL selector) {
 }
 
 static void YTKACECaptionTracksSetter(id receiver, SEL selector, id tracks) {
-    IMP original = YTKACEMiscOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
     if (original != NULL) {
         ((void (*)(id, SEL, id))original)(receiver, selector, tracks);
     }
     id track = YTKACEPreferredCaptionTrack(tracks);
-    id previousTrack = objc_getAssociatedObject(
+    // Only the identity of the last track matters. It used to be stored
+    // unretained and read back as an object, which crashed once the track
+    // was freed; store and compare the bare pointer instead.
+    NSValue *previousTrack = objc_getAssociatedObject(
         receiver, YTKACELastCaptionTrackAssociation);
-    if (previousTrack != track) {
+    const void *trackPointer = (__bridge const void *)track;
+    const void *previousPointer = [previousTrack isKindOfClass:NSValue.class]
+        ? previousTrack.pointerValue : NULL;
+    if (previousPointer != trackPointer) {
         objc_setAssociatedObject(receiver, YTKACELastCaptionTrackAssociation,
-                                 track, OBJC_ASSOCIATION_ASSIGN);
+                                 [NSValue valueWithPointer:trackPointer],
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         YTKACEScheduleCaptionSelection(track);
     }
     if (track == nil) {
@@ -454,7 +474,8 @@ static void YTKACECaptionTracksSetter(id receiver, SEL selector, id tracks) {
 }
 
 static void YTKACECaptionTrackSetter(id receiver, SEL selector, id track) {
-    IMP original = YTKACEMiscOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
     if (original != NULL) {
         ((void (*)(id, SEL, id))original)(receiver, selector, track);
     }
@@ -464,7 +485,8 @@ static void YTKACECaptionSelectedTrackSetter(id receiver,
                                              SEL selector,
                                              id track,
                                              NSInteger reason) {
-    IMP original = YTKACEMiscOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
     if (original != NULL) {
         ((void (*)(id, SEL, id, NSInteger))original)(receiver,
                                                       selector,
@@ -516,7 +538,8 @@ static void YTKACEHUDMessage(id receiver, SEL selector, id message) {
         [lower containsString:@"kids"]) {
         return;
     }
-    IMP original = YTKACEMiscOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
     if (original != NULL) {
         ((void (*)(id, SEL, id))original)(receiver, selector, message);
     }

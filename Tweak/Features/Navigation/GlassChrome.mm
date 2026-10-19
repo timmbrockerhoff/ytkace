@@ -401,11 +401,36 @@ static UIImageView *YTKACEFindIcon(UIView *view, UIView *skip) {
     return nil;
 }
 
+// The mirrored icon used to be stored with OBJC_ASSOCIATION_ASSIGN. Once
+// YouTube released that image view, the next read handed ARC a dangling
+// pointer and crashed. Keep a real weak reference instead.
+@interface YTKACEGlassIconBox : NSObject
+@property (nonatomic, weak) UIImageView *icon;
+@end
+
+@implementation YTKACEGlassIconBox
+@end
+
+static UIImageView *YTKACEMirroredIcon(UIView *button) {
+    YTKACEGlassIconBox *box = objc_getAssociatedObject(button, YTKACEMirroredIconAssociation);
+    return [box isKindOfClass:YTKACEGlassIconBox.class] ? box.icon : nil;
+}
+
+static void YTKACESetMirroredIcon(UIView *button, UIImageView *icon) {
+    YTKACEGlassIconBox *box = nil;
+    if (icon != nil) {
+        box = [YTKACEGlassIconBox new];
+        box.icon = icon;
+    }
+    objc_setAssociatedObject(button, YTKACEMirroredIconAssociation, box,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 static BOOL YTKACEMirrorIcon(UIView *button, UIVisualEffectView *glass) {
-    UIImageView *icon = objc_getAssociatedObject(button, YTKACEMirroredIconAssociation);
+    UIImageView *icon = YTKACEMirroredIcon(button);
     if (icon == nil || icon.superview == nil || ![icon isDescendantOfView:button]) {
         icon = YTKACEFindIcon(button, glass);
-        objc_setAssociatedObject(button, YTKACEMirroredIconAssociation, icon, OBJC_ASSOCIATION_ASSIGN);
+        YTKACESetMirroredIcon(button, icon);
     }
     UIImageView *mirror = objc_getAssociatedObject(button, YTKACEMirrorAssociation);
     if (icon == nil) {
@@ -536,7 +561,7 @@ static void YTKACEGlassInsideButton(UIView *button, CGFloat side) {
 static void YTKACEClearInsideGlass(UIView *button) {
     UIView *glass = objc_getAssociatedObject(button, YTKACEInsideGlassAssociation);
     [glass removeFromSuperview];
-    UIImageView *icon = objc_getAssociatedObject(button, YTKACEMirroredIconAssociation);
+    UIImageView *icon = YTKACEMirroredIcon(button);
     icon.alpha = 1.0;
 }
 

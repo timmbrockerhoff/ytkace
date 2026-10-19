@@ -3,6 +3,7 @@
 #import <mach-o/dyld.h>
 #import <mach-o/getsect.h>
 #import <string.h>
+#import <vector>
 #import "../Features/Downloads/DownloadLog.h"
 
 static NSObject *YTKACEHookLock(void) {
@@ -134,6 +135,31 @@ BOOL YTKACEAddInstanceMethod(NSString *className,
                 [NSString stringWithFormat:@"%@|-|%@", className, selectorName]];
         }
         return added;
+    }
+}
+
+namespace {
+struct YTKACEOriginalFrame {
+    const void *receiver;
+    SEL selector;
+};
+thread_local std::vector<YTKACEOriginalFrame> YTKACEOriginalFrames;
+}
+
+YTKACEOriginalScope::YTKACEOriginalScope(id receiver, SEL selector)
+    : _receiver((__bridge const void *)receiver), _selector(selector), _depth(0) {
+    for (const YTKACEOriginalFrame &frame : YTKACEOriginalFrames) {
+        if (frame.receiver == _receiver && frame.selector == _selector) _depth++;
+    }
+    YTKACEOriginalFrames.push_back({_receiver, _selector});
+}
+
+YTKACEOriginalScope::~YTKACEOriginalScope() {
+    for (auto it = YTKACEOriginalFrames.rbegin(); it != YTKACEOriginalFrames.rend(); ++it) {
+        if (it->receiver == _receiver && it->selector == _selector) {
+            YTKACEOriginalFrames.erase(std::next(it).base());
+            break;
+        }
     }
 }
 

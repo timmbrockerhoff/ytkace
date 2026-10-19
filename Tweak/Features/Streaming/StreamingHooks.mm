@@ -24,12 +24,13 @@ static NSString *YTKACEStreamingKey(Class cls, SEL selector) {
                                       NSStringFromSelector(selector)];
 }
 
-static IMP YTKACEStreamingOriginal(id receiver, SEL selector) {
+static IMP YTKACEStreamingOriginal(id receiver, SEL selector, NSUInteger skip) {
     for (Class cls = object_getClass(receiver); cls != Nil; cls = class_getSuperclass(cls)) {
         IMP value = (IMP)[YTKACEStreamingOriginals[
             YTKACEStreamingKey(cls, selector)] pointerValue];
         if (value != NULL) {
-            return value;
+            if (skip == 0) return value;
+            skip--;
         }
     }
     return NULL;
@@ -365,7 +366,8 @@ static BOOL YTKACEAutoplayValue(id receiver, SEL selector) {
                !YTKACEAutoplayIsQueueConfig(receiver)) {
         result = NO;
     } else {
-        IMP original = YTKACEStreamingOriginal(receiver, selector);
+        YTKACEOriginalScope originalScope(receiver, selector);
+        IMP original = YTKACEStreamingOriginal(receiver, selector, originalScope.depth());
         result = original != NULL
             ? ((BOOL (*)(id, SEL))original)(receiver, selector) : NO;
     }
@@ -374,7 +376,8 @@ static BOOL YTKACEAutoplayValue(id receiver, SEL selector) {
 }
 
 static void YTKACEAutoplaySetter(id receiver, SEL selector, BOOL enabled) {
-    IMP original = YTKACEStreamingOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEStreamingOriginal(receiver, selector, originalScope.depth());
     if (original != NULL) {
         ((void (*)(id, SEL, BOOL))original)(
             receiver,
@@ -393,7 +396,8 @@ static BOOL YTKACECellularQualityValue(id receiver, SEL selector) {
             [name containsString:@"data_saver"];
         return !limiter;
     }
-    IMP original = YTKACEStreamingOriginal(receiver, selector);
+    YTKACEOriginalScope originalScope(receiver, selector);
+    IMP original = YTKACEStreamingOriginal(receiver, selector, originalScope.depth());
     return original != NULL ? ((BOOL (*)(id, SEL))original)(receiver, selector) : NO;
 }
 

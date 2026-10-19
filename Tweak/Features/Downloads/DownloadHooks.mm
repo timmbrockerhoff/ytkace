@@ -1,4 +1,5 @@
 #import "DownloadCoordinator.h"
+#import <os/lock.h>
 #import "DownloadLog.h"
 #import "SABRDownloader.h"
 #import "StreamResolver.h"
@@ -43,11 +44,45 @@ static NSMutableDictionary<NSString *, id> *YTKACEPlaybackRequests;
 static NSMutableArray<NSString *> *YTKACEPlayerRequestOrder;
 static NSMutableArray<NSString *> *YTKACEPlaybackRequestOrder;
 static NSInteger YTKACEPlayerHookAttempts;
-static NSString *YTKACELastCapturedVideoID;
-id YTKACELatestPlayerAuthorization;
+static NSString *YTKACELastCapturedVideoIDStorage;
+static id YTKACELatestPlayerAuthorizationStorage;
+
+// These two are written from network/prefetch threads and read from main.
+// Plain strong globals race (a reader can retain an object another thread is
+// releasing), so they go through a lock.
+static os_unfair_lock YTKACECaptureLock = OS_UNFAIR_LOCK_INIT;
+
+static NSString *YTKACECapturedVideoID(void) {
+    os_unfair_lock_lock(&YTKACECaptureLock);
+    NSString *value = YTKACELastCapturedVideoIDStorage;
+    os_unfair_lock_unlock(&YTKACECaptureLock);
+    return value;
+}
+
+static void YTKACESetCapturedVideoID(NSString *videoID) {
+    if (videoID.length == 0) return;
+    NSString *copy = [videoID copy];
+    os_unfair_lock_lock(&YTKACECaptureLock);
+    YTKACELastCapturedVideoIDStorage = copy;
+    os_unfair_lock_unlock(&YTKACECaptureLock);
+}
+
+id YTKACELatestPlayerAuthorization(void) {
+    os_unfair_lock_lock(&YTKACECaptureLock);
+    id value = YTKACELatestPlayerAuthorizationStorage;
+    os_unfair_lock_unlock(&YTKACECaptureLock);
+    return value;
+}
+
+static void YTKACESetLatestPlayerAuthorization(id authorization) {
+    if (authorization == nil) return;
+    os_unfair_lock_lock(&YTKACECaptureLock);
+    YTKACELatestPlayerAuthorizationStorage = authorization;
+    os_unfair_lock_unlock(&YTKACECaptureLock);
+}
 
 NSString *YTKACELastVideoID(void) {
-    return [YTKACELastCapturedVideoID copy];
+    return [YTKACECapturedVideoID() copy];
 }
 static NSString *YTKACERequestVideoID(id request);
 static void YTKACEPersistPlayerRequest(id request);
@@ -119,12 +154,12 @@ static void YTKACECaptureOnesieSession(id factory,
         return;
     }
     NSString *videoID = YTKACERequestVideoID(playerRequest);
-    if (videoID.length == 0) videoID = YTKACELastCapturedVideoID;
+    if (videoID.length == 0) videoID = YTKACECapturedVideoID();
     YTKACEOnesieSessionState *state = [YTKACEOnesieSessionState new];
     state.factory = factory;
     state.playerRequest = YTKACECopyObject(playerRequest);
     state.authorization = YTKACECopyObject(authorization);
-    if (authorization != nil) YTKACELatestPlayerAuthorization = authorization;
+    YTKACESetLatestPlayerAuthorization(authorization);
     state.dataLoader = dataLoader;
     state.context = context;
     state.cryptor = cryptor;
@@ -390,7 +425,7 @@ static NSString *YTKACERequestVideoID(id request) {
 
 static void YTKACECaptureService(id receiver, id request) {
     NSString *videoID = YTKACERequestVideoID(request);
-    if (videoID.length != 0) YTKACELastCapturedVideoID = videoID;
+    YTKACESetCapturedVideoID(videoID);
     YTKACESABRSetCurrentVideoID(videoID);
     id requestCopy = YTKACECopyObject(request);
     @synchronized (YTKACESABRDownloader.class) {
@@ -560,7 +595,7 @@ static void YTKACEMakePrefetchPlayerRequest(id receiver,
 
 static void YTKACECaptureFactory(id receiver, id request, id properties, id result) {
     NSString *videoID = YTKACERequestVideoID(request);
-    if (videoID.length != 0) YTKACELastCapturedVideoID = videoID;
+    YTKACESetCapturedVideoID(videoID);
     YTKACESABRSetCurrentVideoID(videoID);
     @synchronized (YTKACESABRDownloader.class) {
         YTKACELastPlayerFactory = receiver;

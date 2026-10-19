@@ -661,13 +661,25 @@ static NSUInteger YTKACEQueueEnsureCurrent(void) {
     return 0;
 }
 
+// The panel renderer is a protobuf model whose fields can change between
+// YouTube versions; a missing key used to raise NSUndefinedKeyException
+// from inside YouTube's watch-next getter and kill the app.
+static NSMutableArray *YTKACEQueueMutableContents(id panel) {
+    @try {
+        id contents = [panel valueForKey:@"contentsArray"];
+        return [contents isKindOfClass:NSMutableArray.class] ? contents : nil;
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
 static id YTKACEQueuePanelRenderer(void) {
     NSUInteger currentIndex = YTKACEQueueEnsureCurrent();
     NSArray<NSDictionary *> *queue = [YTKACEQueue() copy];
     if (queue.count < 2) return nil;
     id panel = YTKACEQueueMessage(@"YTIPlaylistPanelRenderer");
     if (panel == nil) return nil;
-    NSMutableArray *contents = [panel valueForKey:@"contentsArray"];
+    NSMutableArray *contents = YTKACEQueueMutableContents(panel);
     if (contents == nil) return nil;
     for (NSUInteger index = 0; index < queue.count; index++) {
         NSDictionary *entry = queue[index];
@@ -683,18 +695,16 @@ static id YTKACEQueuePanelRenderer(void) {
         [contents addObject:item];
     }
     if (contents.count == 0) return nil;
-    [panel setValue:@"YTKACEQueue" forKey:@"playlistId"];
-    [panel setValue:YTKACELocalized(@"Queue") forKey:@"title"];
+    YTKACEQueueSafeSet(panel, @"YTKACEQueue", @"playlistId");
+    YTKACEQueueSafeSet(panel, YTKACELocalized(@"Queue"), @"title");
     id title = YTKACEQueueFormatted(YTKACELocalized(@"Queue"));
-    if (title != nil) [panel setValue:title forKey:@"titleText"];
-    [panel setValue:@(contents.count) forKey:@"totalVideos"];
-    [panel setValue:@(currentIndex == NSNotFound ? 0 : currentIndex)
-             forKey:@"currentIndex"];
-    [panel setValue:@(currentIndex == NSNotFound ? 0 : currentIndex)
-             forKey:@"localCurrentIndex"];
-    [panel setValue:@YES forKey:@"isEditable"];
+    if (title != nil) YTKACEQueueSafeSet(panel, title, @"titleText");
+    YTKACEQueueSafeSet(panel, @(contents.count), @"totalVideos");
+    YTKACEQueueSafeSet(panel, @(currentIndex == NSNotFound ? 0 : currentIndex), @"currentIndex");
+    YTKACEQueueSafeSet(panel, @(currentIndex == NSNotFound ? 0 : currentIndex), @"localCurrentIndex");
+    YTKACEQueueSafeSet(panel, @YES, @"isEditable");
     id reorder = YTKACEQueueSentinelCommand(@"reorder", @"");
-    if (reorder != nil) [panel setValue:reorder forKey:@"onReorderEndpoint"];
+    if (reorder != nil) YTKACEQueueSafeSet(panel, reorder, @"onReorderEndpoint");
     return panel;
 }
 
@@ -707,14 +717,14 @@ static void YTKACEQueueAppendToController(NSDictionary *entry,
     if (![controller respondsToSelector:selector]) return;
     id panel = YTKACEQueueMessage(@"YTIPlaylistPanelRenderer");
     if (panel == nil) return;
-    NSMutableArray *contents = [panel valueForKey:@"contentsArray"];
+    NSMutableArray *contents = YTKACEQueueMutableContents(panel);
     id item = YTKACEQueuePanelItem(entry[@"videoId"], entry[@"title"],
                                    entry[@"author"], entry[@"length"], NO,
                                    insertIndex);
     if (contents == nil || item == nil) return;
     [contents addObject:item];
-    [panel setValue:@"YTKACEQueue" forKey:@"playlistId"];
-    [panel setValue:@1 forKey:@"totalVideos"];
+    YTKACEQueueSafeSet(panel, @"YTKACEQueue", @"playlistId");
+    YTKACEQueueSafeSet(panel, @1, @"totalVideos");
     @try {
         ((void (*)(id, SEL, id, id, unsigned long long, BOOL, BOOL))objc_msgSend)(
             controller, selector, panel, YTKACELastWatchNextResponse,

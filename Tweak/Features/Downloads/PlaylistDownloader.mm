@@ -579,7 +579,7 @@ static void YTKACECollectPlaylistJSON(id node, NSMutableArray<NSDictionary *> *i
     }
 }
 
-extern id YTKACELatestPlayerAuthorization;
+id YTKACELatestPlayerAuthorization(void);
 static id YTKACERequestAuthorization;
 static IMP OriginalAuthorizeCompletion;
 static IMP OriginalAuthorizeCallback;
@@ -601,7 +601,7 @@ static void YTKACEAuthorizeCallback(id receiver, SEL selector, id request, id ca
 }
 
 static NSString *YTKACEPlaylistAuthHeader(void) {
-    id auth = YTKACELatestPlayerAuthorization ?: YTKACERequestAuthorization;
+    id auth = YTKACELatestPlayerAuthorization() ?: YTKACERequestAuthorization;
     if (auth == nil) return nil;
     for (NSString *selectorName in @[@"accessToken", @"token", @"authToken", @"oauthToken"]) {
         SEL selector = NSSelectorFromString(selectorName);
@@ -722,11 +722,11 @@ static void YTKACEFetchFullPlaylist(NSString *playlistID, void (^completion)(NSA
         if (items.count == 0) {
             NSString *header = YTKACEPlaylistAuthHeader();
             YTKACEDebugLog(@"playlist", @"auth personal=%d header=%d player=%d request=%d", personal,
-                              header.length != 0, YTKACELatestPlayerAuthorization != nil,
+                              header.length != 0, YTKACELatestPlayerAuthorization() != nil,
                               YTKACERequestAuthorization != nil);
             if (header.length != 0) items = YTKACEFetchPlaylistPages(playlistID, header, &pages);
             else YTKACEDownloadLog(@"playlist", @"no auth header player=%d request=%d",
-                                   YTKACELatestPlayerAuthorization != nil, YTKACERequestAuthorization != nil);
+                                   YTKACELatestPlayerAuthorization() != nil, YTKACERequestAuthorization != nil);
         }
         YTKACEDownloadLog(@"playlist", @"fetched %lu items in %lu pages for %@", (unsigned long)items.count,
                           (unsigned long)pages, playlistID);
