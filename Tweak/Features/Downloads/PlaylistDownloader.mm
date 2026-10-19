@@ -114,7 +114,8 @@ static void YTKACEPlaylistHeaderModel(id receiver, SEL selector, id model) {
         YTKACEPlaylistText(YTKACEPlaylistValue(renderer, @"title")) ?: @"";
 }
 
-static NSMutableDictionary<NSString *, UIImage *> *YTKACEPlaylistThumbnails;
+// Bounded: a long playlist must not pin every decoded thumbnail forever.
+static NSCache<NSString *, UIImage *> *YTKACEPlaylistThumbnails;
 
 static UIImage *YTKACEPlaylistPlaceholderImage(void) {
     static UIImage *placeholder;
@@ -197,23 +198,33 @@ heightForRowAtIndexPath:(NSIndexPath *)indexPath {
     NSString *thumbnail = item[@"thumbnail"];
     NSString *videoID = item[@"videoId"];
     if (thumbnail.length != 0) {
-        UIImage *cached = YTKACEPlaylistThumbnails[videoID];
+        UIImage *cached = videoID.length != 0
+            ? [YTKACEPlaylistThumbnails objectForKey:videoID] : nil;
+        NSURL *thumbnailURL = [NSURL URLWithString:thumbnail];
         if (cached != nil) {
             cell.imageView.image = cached;
-        } else {
+        } else if (videoID.length != 0 && thumbnailURL != nil) {
             __weak UITableView *weakTable = tableView;
-            dispatch_async(dispatch_get_global_queue(
-                DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
-                NSData *data = [NSData dataWithContentsOfURL:
-                    [NSURL URLWithString:thumbnail]];
-                UIImage *image = data != nil ? [UIImage imageWithData:data] : nil;
+            NSMutableURLRequest *request =
+                [NSMutableURLRequest requestWithURL:thumbnailURL];
+            request.timeoutInterval = 15.0;
+            [[NSURLSession.sharedSession dataTaskWithRequest:request
+                completionHandler:^(NSData *data, __unused NSURLResponse *response,
+                                    __unused NSError *error) {
+                UIImage *image = data.length != 0 ? [UIImage imageWithData:data] : nil;
                 if (image == nil) return;
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    YTKACEPlaylistThumbnails[videoID] = image;
-                    [weakTable reloadRowsAtIndexPaths:@[indexPath]
-                                     withRowAnimation:UITableViewRowAnimationNone];
+                    [YTKACEPlaylistThumbnails setObject:image forKey:videoID];
+                    UITableView *table = weakTable;
+                    // The row may be gone (or the table reloaded) by now.
+                    if (table == nil || indexPath.section >= table.numberOfSections ||
+                        indexPath.row >= [table numberOfRowsInSection:indexPath.section]) {
+                        return;
+                    }
+                    [table reloadRowsAtIndexPaths:@[indexPath]
+                                 withRowAnimation:UITableViewRowAnimationNone];
                 });
-            });
+            }] resume];
         }
     }
     return cell;
@@ -1089,7 +1100,8 @@ void YTKACEInstallPlaylistDownloaderHooks(void) {
     if (YTKACEPlaylistItems == nil) {
         YTKACEPlaylistItems = [NSMutableDictionary dictionary];
         YTKACEPlaylistSeen = [NSMutableDictionary dictionary];
-        YTKACEPlaylistThumbnails = [NSMutableDictionary dictionary];
+        YTKACEPlaylistThumbnails = [NSCache new];
+        YTKACEPlaylistThumbnails.countLimit = 100;
     }
     BOOL contents = YTKACEInstallInstanceHook(@"YTIPlaylistVideoListRenderer",
                                               @"contentsArray",
