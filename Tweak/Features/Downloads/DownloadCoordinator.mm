@@ -1879,9 +1879,13 @@ void YTKACESaveVideoToPhotosFile(NSURL *url,
                 [strongSelf finishCancelledJob:job];
                 return;
             }
-            YTKACEDownloadLog(job.identifier, @"direct failed error=%@ fallback=sabr",
-                error.localizedDescription ?: @"incomplete");
-            if (![strongSelf prepareSABRFallbackForJob:job]) {
+            // Disk full: SABR would hit the same wall, so report it directly.
+            const BOOL storageFailure =
+                [error.domain isEqualToString:@"YTKACEStorage"];
+            YTKACEDownloadLog(job.identifier, @"direct failed error=%@ fallback=%@",
+                error.localizedDescription ?: @"incomplete",
+                storageFailure ? @"none" : @"sabr");
+            if (storageFailure || ![strongSelf prepareSABRFallbackForJob:job]) {
                 [YTKACEDownloadProgressView.sharedView finishJob:job.identifier
                     success:NO message:YTKACELocalized(@"Failed")];
                 [strongSelf showAlertWithTitle:YTKACELocalized(@"Download failed")
