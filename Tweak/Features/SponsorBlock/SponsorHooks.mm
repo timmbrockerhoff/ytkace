@@ -42,7 +42,10 @@ static void YTKACERefreshPlaybackTimePreferenceState(void) {
         YTKACEFeatureEnabled(@"autoSkipShorts") ||
         YTKACEFeatureEnabled(YTKACESpeedKey) ||
         YTKACEFeatureEnabled(YTKACESleepTimerKey) ||
-        YTKACEFeatureEnabled(@"YTKACE.Preference.Playback.LocalQueue");
+        YTKACEFeatureEnabled(@"YTKACE.Preference.Playback.LocalQueue") ||
+        // The Shorts session limit counts watch time from these notifications
+        // only; without it here the limit never fired on its own.
+        YTKACEFeatureEnabled(@"YTKACE.Preference.Shorts.LimitEnabled");
 }
 
 static void YTKACEPublishPlaybackTime(id receiver, double time) {

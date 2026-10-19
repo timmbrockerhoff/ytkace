@@ -48,10 +48,17 @@ static BOOL YTKACEInstallHook(NSString *className,
         return NO;
     }
 
-    NSString *key = [NSString stringWithFormat:@"%@|%@|%@",
+    // One key per method *and* replacement. Several modules may hook the same
+    // method (for example the queue and autoplay both watch didPressNext:);
+    // keying on the method alone used to drop every hook after the first one
+    // without telling anyone. Now each new replacement is chained on top of
+    // the current implementation, and only an identical re-install (a module
+    // retrying its own setup) is a no-op.
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%@|%p",
                      className,
                      classMethod ? @"+" : @"-",
-                     selectorName];
+                     selectorName,
+                     (void *)replacement];
 
     @synchronized (YTKACEHookLock()) {
         if ([YTKACEHookKeys() containsObject:key]) {
@@ -59,6 +66,9 @@ static BOOL YTKACEInstallHook(NSString *className,
         }
 
         IMP original = method_getImplementation(method);
+        if (original == replacement) {
+            return YES;
+        }
         const char *types = method_getTypeEncoding(method);
 
         BOOL added = class_addMethod(targetClass, selector, replacement, types);
@@ -67,7 +77,9 @@ static BOOL YTKACEInstallHook(NSString *className,
             if (directMethod == NULL) {
                 return NO;
             }
-            method_setImplementation(directMethod, replacement);
+            // Read the implementation that is about to be replaced right here,
+            // so a hook installed earlier on this class becomes our original.
+            original = method_setImplementation(directMethod, replacement);
         }
 
         if (originalStorage != NULL) {
