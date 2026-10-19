@@ -57,7 +57,8 @@ static void YTKACELoadQueueInfo(NSURL *URL, void (^completion)(NSDictionary *inf
     pending[key] = [NSMutableArray arrayWithObject:[completion copy]];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSMutableDictionary *info = [NSMutableDictionary dictionary];
-        UIImage *artwork = YTKACEMediaArtworkImage(URL);
+        // The row thumbnail is 44 pt; decode a small, aspect-fill-safe size instead of full size.
+        UIImage *artwork = YTKACEMediaArtworkImageWithMaxPixelSize(URL, 256.0);
         if (artwork != nil && artwork.size.width > 0.0 && artwork.size.height > 0.0) {
             CGFloat side = 44.0;
             UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
@@ -177,6 +178,8 @@ static void YTKACELoadQueueInfo(NSURL *URL, void (^completion)(NSDictionary *inf
 @property(nonatomic, assign) BOOL scrubbing;
 @property(nonatomic, assign) NSInteger sleepMinutes;
 @property(nonatomic, copy) NSURL *artworkURL;
+@property(nonatomic, copy) NSURL *channelURL;
+@property(nonatomic, copy) NSString *channelName;
 @end
 
 @implementation YTKACEAudioPlayerController
@@ -222,7 +225,7 @@ static void YTKACELoadQueueInfo(NSURL *URL, void (^completion)(NSDictionary *inf
         selector:@selector(playbackChanged:)
         name:YTKACEDownloadPlaybackDidChangeNotification object:nil];
     [NSNotificationCenter.defaultCenter addObserver:self
-        selector:@selector(playbackChanged:)
+        selector:@selector(downloadInfoChanged:)
         name:YTKACEDownloadInfoDidChangeNotification object:nil];
     __weak YTKACEAudioPlayerController *weakSelf = self;
     self.timeObserver = [self.session.player addPeriodicTimeObserverForInterval:
@@ -660,10 +663,25 @@ static void YTKACELoadQueueInfo(NSURL *URL, void (^completion)(NSDictionary *inf
     [self refresh];
 }
 
+- (void)downloadInfoChanged:(NSNotification *)notification {
+    NSURL *URL = notification.object;
+    if (![URL isKindOfClass:NSURL.class] || [URL.path isEqualToString:self.channelURL.path]) {
+        self.channelURL = nil;
+    }
+    if ([URL isKindOfClass:NSURL.class]) [YTKACEQueueInfoCache() removeObjectForKey:URL.path];
+    [self refresh];
+}
+
 - (void)refresh {
     NSURL *URL = self.session.currentURL;
     self.titleLabel.text = URL.lastPathComponent.stringByDeletingPathExtension ?: @"Audio";
-    self.channelLabel.text = URL == nil ? nil : YTKACEStoredChannelName(URL);
+    // Reading the channel means an xattr read + JSON parse; refresh runs on every playback
+    // change, so only re-read it when the track changes or its info was rewritten.
+    if (URL == nil || ![URL isEqual:self.channelURL]) {
+        self.channelURL = URL;
+        self.channelName = URL == nil ? nil : YTKACEStoredChannelName(URL);
+    }
+    self.channelLabel.text = self.channelName;
     if (![URL isEqual:self.artworkURL]) {
         self.artworkURL = URL;
         UIImage *artwork = URL == nil ? nil : YTKACEMediaArtworkImage(URL);
@@ -1047,6 +1065,7 @@ static void YTKACELoadQueueInfo(NSURL *URL, void (^completion)(NSDictionary *inf
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if ((NSUInteger)indexPath.row >= self.session.playlist.count) return;
     NSURL *URL = self.session.playlist[(NSUInteger)indexPath.row];
     [self.session loadURL:URL playlist:self.session.playlist index:indexPath.row];
     [self refresh];
@@ -1077,6 +1096,10 @@ static void YTKACELoadQueueInfo(NSURL *URL, void (^completion)(NSDictionary *inf
            toIndexPath:(NSIndexPath *)destination {
     (void)tableView;
     NSMutableArray<NSURL *> *queue = [self.session.playlist mutableCopy];
+    if ((NSUInteger)source.row >= queue.count || (NSUInteger)destination.row >= queue.count) {
+        [self refresh];
+        return;
+    }
     NSURL *URL = queue[(NSUInteger)source.row];
     [queue removeObjectAtIndex:(NSUInteger)source.row];
     [queue insertObject:URL atIndex:(NSUInteger)destination.row];
