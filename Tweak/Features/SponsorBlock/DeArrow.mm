@@ -247,11 +247,34 @@ static void YTKACEFlushStore(void) {
     BOOL pending = YTKACEPersistPending;
     os_unfair_lock_unlock(&YTKACELock);
     if (!pending) return;
-    dispatch_sync(YTKACEPersistQueue(), ^{
+    // Called on main when the app goes to the background. Don't block main on
+    // the persist queue (the defaults write posts notifications that other
+    // code may observe on main); ask for a little background time instead.
+    UIApplication *application = nil;
+    if (NSThread.isMainThread) application = UIApplication.sharedApplication;
+    __block UIBackgroundTaskIdentifier task = UIBackgroundTaskInvalid;
+    if (application != nil) {
+        task = [application beginBackgroundTaskWithName:@"YTKACE.DeArrow.Persist"
+                                      expirationHandler:^{
+            if (task != UIBackgroundTaskInvalid) {
+                [application endBackgroundTask:task];
+                task = UIBackgroundTaskInvalid;
+            }
+        }];
+    }
+    dispatch_async(YTKACEPersistQueue(), ^{
         os_unfair_lock_lock(&YTKACELock);
         BOOL stillPending = YTKACEPersistPending;
         os_unfair_lock_unlock(&YTKACELock);
         if (stillPending) YTKACEPersistStoreNow();
+        if (application != nil) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (task != UIBackgroundTaskInvalid) {
+                    [application endBackgroundTask:task];
+                    task = UIBackgroundTaskInvalid;
+                }
+            });
+        }
     });
 }
 

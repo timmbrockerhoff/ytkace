@@ -443,6 +443,13 @@ static id YTKACECaptionControllerInit(id receiver, SEL selector) {
     return result;
 }
 
+@interface YTKACECaptionTrackBox : NSObject
+@property (nonatomic, weak) id track;
+@end
+
+@implementation YTKACECaptionTrackBox
+@end
+
 static void YTKACECaptionTracksSetter(id receiver, SEL selector, id tracks) {
     YTKACEOriginalScope originalScope(receiver, selector);
     IMP original = YTKACEMiscOriginal(receiver, selector, originalScope.depth());
@@ -450,18 +457,20 @@ static void YTKACECaptionTracksSetter(id receiver, SEL selector, id tracks) {
         ((void (*)(id, SEL, id))original)(receiver, selector, tracks);
     }
     id track = YTKACEPreferredCaptionTrack(tracks);
-    // Only the identity of the last track matters. It used to be stored
-    // unretained and read back as an object, which crashed once the track
-    // was freed; store and compare the bare pointer instead.
-    NSValue *previousTrack = objc_getAssociatedObject(
+    // The last track used to be stored unretained and read back as an
+    // object, which crashed once the track was freed. Keep a weak reference.
+    YTKACECaptionTrackBox *previousBox = objc_getAssociatedObject(
         receiver, YTKACELastCaptionTrackAssociation);
-    const void *trackPointer = (__bridge const void *)track;
-    const void *previousPointer = [previousTrack isKindOfClass:NSValue.class]
-        ? previousTrack.pointerValue : NULL;
-    if (previousPointer != trackPointer) {
+    id previousTrack = [previousBox isKindOfClass:YTKACECaptionTrackBox.class]
+        ? previousBox.track : nil;
+    if (previousTrack != track) {
+        YTKACECaptionTrackBox *box = nil;
+        if (track != nil) {
+            box = [YTKACECaptionTrackBox new];
+            box.track = track;
+        }
         objc_setAssociatedObject(receiver, YTKACELastCaptionTrackAssociation,
-                                 [NSValue valueWithPointer:trackPointer],
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                                 box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         YTKACEScheduleCaptionSelection(track);
     }
     if (track == nil) {
