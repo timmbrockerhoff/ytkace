@@ -16,6 +16,7 @@ static IMP OriginalContextualWillAppear;
 static IMP OriginalContextualLayout;
 
 static const void *YTKACESheetGlassAssociation = &YTKACESheetGlassAssociation;
+static const void *YTKACESheetGlassPendingAssociation = &YTKACESheetGlassPendingAssociation;
 
 static BOOL YTKACESheetGlassEnabled(void) {
     return YTKACELiquidGlassAvailable() && YTKACEFeatureEnabled(@"YTKACE.Preference.Glass.Menus");
@@ -153,6 +154,7 @@ static void YTKACEApplyPanelGlass(UIView *sheet, CGFloat fallbackRadius) {
 }
 
 static void YTKACEApplySheetGlassLater(UIViewController *controller) {
+    if (!YTKACESheetGlassEnabled()) return;
     __weak UIViewController *weakController = controller;
     for (NSNumber *delay in @[@0.05, @0.15, @0.3, @0.5, @0.8, @1.2]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
@@ -164,14 +166,26 @@ static void YTKACEApplySheetGlassLater(UIViewController *controller) {
     }
 }
 
-static void YTKACESheetLayout(UIViewController *receiver, SEL selector) {
-    if (OriginalSheetLayout != NULL) ((void (*)(id, SEL))OriginalSheetLayout)(receiver, selector);
-    if (!YTKACESheetGlassEnabled()) return;
+// viewWillLayoutSubviews can fire many times per run loop turn; one deferred
+// application after the layout pass covers all of them.
+static void YTKACEApplySheetGlassAsync(UIViewController *receiver) {
+    if (objc_getAssociatedObject(receiver, YTKACESheetGlassPendingAssociation) != nil) return;
+    objc_setAssociatedObject(receiver, YTKACESheetGlassPendingAssociation, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     __weak UIViewController *weakController = receiver;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *controller = weakController;
-        if (controller != nil) YTKACEApplySheetGlass(controller);
+        if (controller == nil) return;
+        objc_setAssociatedObject(controller, YTKACESheetGlassPendingAssociation, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        YTKACEApplySheetGlass(controller);
     });
+}
+
+static void YTKACESheetLayout(UIViewController *receiver, SEL selector) {
+    if (OriginalSheetLayout != NULL) ((void (*)(id, SEL))OriginalSheetLayout)(receiver, selector);
+    if (!YTKACESheetGlassEnabled()) return;
+    YTKACEApplySheetGlassAsync(receiver);
 }
 
 static void YTKACESheetWillAppear(UIViewController *receiver, SEL selector, BOOL animated) {
@@ -279,11 +293,7 @@ static void YTKACEContextualWillAppear(UIViewController *receiver, SEL selector,
 static void YTKACEContextualLayout(UIViewController *receiver, SEL selector) {
     if (OriginalContextualLayout != NULL) ((void (*)(id, SEL))OriginalContextualLayout)(receiver, selector);
     if (!YTKACESheetGlassEnabled()) return;
-    __weak UIViewController *weakController = receiver;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *controller = weakController;
-        if (controller != nil) YTKACEApplySheetGlass(controller);
-    });
+    YTKACEApplySheetGlassAsync(receiver);
 }
 
 __attribute__((constructor)) static void YTKACEInstallGlassSheets(void) {
