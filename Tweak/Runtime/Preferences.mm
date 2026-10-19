@@ -3,6 +3,12 @@
 #import "../Features/Downloads/SABRDownloader.h"
 
 #import <UIKit/UIKit.h>
+#import <os/lock.h>
+#import <stdatomic.h>
+
+#ifndef YTKACE_VERSION_STRING
+#define YTKACE_VERSION_STRING "unknown"
+#endif
 
 NSString * const YTKACEMasterEnabledKey = @"YTKACE.Preference.Enabled";
 NSString * const YTKACEOLEDKey = @"YTKACE.Preference.Appearance.OLED";
@@ -17,12 +23,72 @@ NSString * const YTKACESleepTimerKey = @"YTKACE.Preference.Player.SleepTimer";
 NSString * const YTKACEPreferencesDidChangeNotification =
     @"YTKACEPreferencesDidChangeNotification";
 
+static NSUInteger YTKACERemoveSystemCaches(BOOL measure);
+
 static NSUserDefaults *YTKACEDefaults(void) {
     return NSUserDefaults.standardUserDefaults;
 }
 
+// In-memory cache of boolean feature flags. YTKACEFeatureEnabled is called from
+// hot paths (layout, scrolling, renderer filtering); a defaults lookup there costs
+// a CFPreferences round trip every time. The cache is dropped whenever a
+// preference changes through the tweak's setters or through any other
+// NSUserDefaults write in the process (backup restore, tab editor, ...).
+static os_unfair_lock YTKACEFeatureCacheLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableDictionary<NSString *, NSNumber *> *YTKACEFeatureCache;
+static _Atomic(uint64_t) YTKACEFeatureCacheGeneration = 1;
+
+static void YTKACEInvalidatePreferenceCache(void) {
+    os_unfair_lock_lock(&YTKACEFeatureCacheLock);
+    [YTKACEFeatureCache removeAllObjects];
+    atomic_fetch_add(&YTKACEFeatureCacheGeneration, 1);
+    os_unfair_lock_unlock(&YTKACEFeatureCacheLock);
+}
+
+static void YTKACEEnsurePreferenceCacheObservers(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        os_unfair_lock_lock(&YTKACEFeatureCacheLock);
+        YTKACEFeatureCache = [NSMutableDictionary dictionary];
+        os_unfair_lock_unlock(&YTKACEFeatureCacheLock);
+        NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+        for (NSNotificationName name in @[NSUserDefaultsDidChangeNotification,
+                                          YTKACEPreferencesDidChangeNotification]) {
+            [center addObserverForName:name
+                                object:nil
+                                 queue:nil
+                            usingBlock:^(__unused NSNotification *note) {
+                YTKACEInvalidatePreferenceCache();
+            }];
+        }
+    });
+}
+
+uint64_t YTKACEPreferenceGeneration(void) {
+    YTKACEEnsurePreferenceCacheObservers();
+    return atomic_load(&YTKACEFeatureCacheGeneration);
+}
+
+static BOOL YTKACECachedBool(NSString *key) {
+    YTKACEEnsurePreferenceCacheObservers();
+    os_unfair_lock_lock(&YTKACEFeatureCacheLock);
+    NSNumber *cached = YTKACEFeatureCache[key];
+    uint64_t generation = atomic_load(&YTKACEFeatureCacheGeneration);
+    os_unfair_lock_unlock(&YTKACEFeatureCacheLock);
+    if (cached != nil) return cached.boolValue;
+    BOOL value = [YTKACEDefaults() boolForKey:key];
+    os_unfair_lock_lock(&YTKACEFeatureCacheLock);
+    // Only store when no invalidation happened while we were reading.
+    if (generation == atomic_load(&YTKACEFeatureCacheGeneration)) {
+        YTKACEFeatureCache[key] = @(value);
+    }
+    os_unfair_lock_unlock(&YTKACEFeatureCacheLock);
+    return value;
+}
+
 static void YTKACEAnnouncePreferenceChange(NSString *key) {
     if (key.length == 0) return;
+    YTKACEInvalidatePreferenceCache();
     if ([key isEqualToString:@"YTKACE.Preference.Language"]) {
         YTKACEResetLocalizationCache();
     }
@@ -193,12 +259,12 @@ void YTKACERegisterDefaults(void) {
                 URLByAppendingPathComponent:@"Cache"
                                 isDirectory:YES];
             [NSFileManager.defaultManager removeItemAtURL:cache error:nil];
-            YTKACEPurgeSystemCaches();
+            YTKACERemoveSystemCaches(NO);
             [YTKACEDefaults() setObject:NSDate.date
                                  forKey:@"YTKACE.Preference.Downloads.LastCacheClear"];
         }
     }
-    YTKACEPurgeDownloadScratch(NO);
+    YTKACEInvalidatePreferenceCache();
 }
 
 NSInteger YTKACEDownloadPlacement(void) {
@@ -217,7 +283,7 @@ BOOL YTKACEFeatureEnabled(NSString *key) {
     if (!YTKACEMasterEnabled() || key.length == 0) {
         return NO;
     }
-    return [YTKACEDefaults() boolForKey:key];
+    return YTKACECachedBool(key);
 }
 
 BOOL YTKACEOLEDActive(UITraitCollection *traits) {
@@ -271,7 +337,7 @@ BOOL YTKACESponsorBlockEnabled(void) {
         return NO;
     }
 
-    return [YTKACEDefaults() boolForKey:YTKACESponsorBlockKey];
+    return YTKACECachedBool(YTKACESponsorBlockKey);
 }
 
 void YTKACESetPreference(NSString *key, BOOL enabled) {
@@ -360,7 +426,7 @@ static void YTKACERepairDownloads(NSURL *root) {
     }
 }
 
-NSUInteger YTKACEPurgeSystemCaches(void) {
+static NSUInteger YTKACERemoveSystemCaches(BOOL measure) {
     NSFileManager *manager = NSFileManager.defaultManager;
     NSArray<NSURL *> *roots = [manager URLsForDirectory:NSCachesDirectory
                                              inDomains:NSUserDomainMask];
@@ -370,6 +436,10 @@ NSUInteger YTKACEPurgeSystemCaches(void) {
             includingPropertiesForKeys:@[NSURLTotalFileAllocatedSizeKey]
                                options:0 error:nil];
         for (NSURL *entry in entries) {
+            if (!measure) {
+                [manager removeItemAtURL:entry error:nil];
+                continue;
+            }
             NSDirectoryEnumerator *walker = [manager enumeratorAtURL:entry
                 includingPropertiesForKeys:@[NSURLTotalFileAllocatedSizeKey]
                                    options:0 errorHandler:nil];
@@ -388,6 +458,12 @@ NSUInteger YTKACEPurgeSystemCaches(void) {
     }
     return freed;
 }
+
+NSUInteger YTKACEPurgeSystemCaches(void) {
+    return YTKACERemoveSystemCaches(YES);
+}
+
+static BOOL YTKACELegacyStorageMigrated;
 
 NSURL *YTKACEApplicationSupportDirectory(void) {
     NSFileManager *manager = NSFileManager.defaultManager;
@@ -431,8 +507,50 @@ NSURL *YTKACEApplicationSupportDirectory(void) {
                 }
             }
             [manager removeItemAtURL:legacy error:nil];
+            YTKACELegacyStorageMigrated = YES;
         }
-        YTKACERepairDownloads(directory);
     });
     return directory;
+}
+
+static NSString * const YTKACEStorageRepairVersionKey = @"YTKACE.Storage.RepairedVersion";
+
+static void YTKACERunStartupMaintenance(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        @autoreleasepool {
+            NSURL *directory = YTKACEApplicationSupportDirectory();
+            NSString *version = @YTKACE_VERSION_STRING;
+            NSString *repaired = [YTKACEDefaults()
+                stringForKey:YTKACEStorageRepairVersionKey];
+            if (YTKACELegacyStorageMigrated || ![repaired isEqualToString:version]) {
+                YTKACERepairDownloads(directory);
+                [YTKACEDefaults() setObject:version
+                                     forKey:YTKACEStorageRepairVersionKey];
+            }
+            YTKACEPurgeDownloadScratch(NO);
+        }
+    });
+}
+
+void YTKACEScheduleStartupMaintenance(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        void (^schedule)(double) = ^(double delay) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(delay * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                YTKACERunStartupMaintenance();
+            });
+        };
+        [NSNotificationCenter.defaultCenter
+            addObserverForName:UIApplicationDidFinishLaunchingNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(__unused NSNotification *note) {
+            schedule(3.0);
+        }];
+        // Fallback in case the launch notification was already posted.
+        schedule(20.0);
+    });
 }
