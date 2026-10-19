@@ -2,24 +2,35 @@ name: Deb
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
+  pull_request:
   workflow_dispatch:
   workflow_call:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       - name: Test
         run: python3 -m unittest discover -s Tests -v
 
+      - name: ShellCheck (advisory)
+        continue-on-error: true
+        run: |
+          command -v shellcheck >/dev/null || sudo apt-get install -y shellcheck
+          shellcheck Scripts/*.sh Tools/*.sh
+
   build:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -29,37 +40,82 @@ jobs:
           - scheme: roothide
             suffix: roothide
     env:
-      THEOS: ${{ github.workspace }}/.theos
       CI: true
+      # Pinned toolchain inputs. Bump these together; the cache key is derived
+      # from them, so a bump always produces a fresh Theos install.
+      THEOS_REPO: https://github.com/roothide/theos.git
+      THEOS_COMMIT: cfba89a53a05b4a1b822121158acc3669c20602f
+      TOOLCHAIN_TAG: test-210562a
+      TOOLCHAIN_SHA256: a72a7a577e2fbe2838b6b5e9c72034fa7d114af96f0e1d4b016f18730ce4056e
+      SDK_RELEASE: master-146e41f
+      SDK_NAME: iPhoneOS16.5
+      SDK_SHA256: 5e0fd3f01266cce4ce012d4a99b38eb56578fca40d09edc81cd83dee958202fb
     steps:
       - uses: actions/checkout@v6
+
+      # Keep Theos outside the project: the project's own build directory is
+      # also called .theos, and sharing it would leak build output into the cache.
+      - name: Locate Theos
+        run: echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
 
       - name: Cache Theos
         id: cache-theos
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/.theos
-          key: roothide-theos-${{ runner.os }}-v1
+          path: ${{ runner.temp }}/theos
+          key: theos-${{ runner.os }}-${{ runner.arch }}-${{ env.THEOS_COMMIT }}-${{ env.TOOLCHAIN_TAG }}-${{ env.SDK_NAME }}-${{ env.SDK_RELEASE }}
 
-      - name: Setup
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential fakeroot rsync curl perl zip git libxml2 libtinfo6 xz-utils
+          sudo update-alternatives --set fakeroot /usr/bin/fakeroot-sysv
+
+      - name: Install Theos (pinned)
         if: steps.cache-theos.outputs.cache-hit != 'true'
-        run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf "$THEOS"
+          git clone --recursive "$THEOS_REPO" "$THEOS"
+          git -C "$THEOS" checkout --detach "$THEOS_COMMIT"
+          git -C "$THEOS" submodule update --init --recursive
+
+          toolchain="$RUNNER_TEMP/iOSToolchain.tar.xz"
+          curl -fsSL --retry 3 -o "$toolchain" \
+            "https://github.com/L1ghtmann/llvm-project/releases/download/${TOOLCHAIN_TAG}/iOSToolchain-x86_64.tar.xz"
+          echo "${TOOLCHAIN_SHA256}  ${toolchain}" | sha256sum -c -
+          mkdir -p "$THEOS/toolchain"
+          tar -xJf "$toolchain" -C "$THEOS/toolchain"
+          rm -f "$toolchain"
+          test -x "$THEOS/toolchain/linux/iphone/bin/clang"
+
+          sdk="$RUNNER_TEMP/${SDK_NAME}.sdk.tar.xz"
+          curl -fsSL --retry 3 -o "$sdk" \
+            "https://github.com/theos/sdks/releases/download/${SDK_RELEASE}/${SDK_NAME}.sdk.tar.xz"
+          echo "${SDK_SHA256}  ${sdk}" | sha256sum -c -
+          mkdir -p "$THEOS/sdks"
+          tar -xJf "$sdk" -C "$THEOS/sdks"
+          rm -f "$sdk"
+          test -d "$THEOS/sdks/${SDK_NAME}.sdk"
 
       - name: Build
+        env:
+          SCHEME: ${{ matrix.scheme }}
         run: |
           make clean
           make package FINALPACKAGE=1 \
-            THEOS_PACKAGE_SCHEME="${{ matrix.scheme }}" \
+            THEOS_PACKAGE_SCHEME="$SCHEME" \
             DISABLE_ROOTLESS_COMPAT_WARNING=1
 
       - name: Name package
         id: name
+        env:
+          SUFFIX: ${{ matrix.suffix }}
         run: |
           deb="$(ls packages/*.deb | head -1)"
           version="$(awk '/^Version:/ {print $2}' control)"
-          output="com.itzzace.ytkace_${version}_${{ matrix.suffix }}.deb"
+          output="com.itzzace.ytkace_${version}_${SUFFIX}.deb"
           mkdir -p artifacts
           cp "$deb" "artifacts/$output"
           echo "deb=artifacts/$output" >> "$GITHUB_OUTPUT"

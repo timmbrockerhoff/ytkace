@@ -13,6 +13,16 @@ on:
         required: false
         default: "https://www.dropbox.com/scl/fi/a937ul1u0s72xri2e2m3i/com.google.ios.youtube-21.41.5-eeveedecrypter.ipa?rlkey=ycya2apwz7fs1x1w3ua8y0mcu&st=nyvrtfpy&dl=1"
         type: string
+      ipa_sha256:
+        description: Optional SHA-256 of the first IPA. When set, the download must match it.
+        required: false
+        default: ""
+        type: string
+      ipa_sha256_ios17:
+        description: Optional SHA-256 of the second (iOS 17+) IPA. When set, the download must match it.
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -22,7 +32,7 @@ jobs:
     uses: ./.github/workflows/build-deb.yml
 
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       targets: ${{ steps.targets.outputs.targets }}
     steps:
@@ -31,21 +41,35 @@ jobs:
         env:
           IPA_URL: ${{ inputs.ipa_url }}
           IPA_URL_IOS17: ${{ inputs.ipa_url_ios17 }}
+          IPA_SHA256: ${{ inputs.ipa_sha256 }}
+          IPA_SHA256_IOS17: ${{ inputs.ipa_sha256_ios17 }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           import os
+          import re
+          import sys
 
-          targets = [{"label": "ios16", "url": os.environ["IPA_URL"]}]
+
+          def checksum(name):
+              value = os.environ.get(name, "").strip().lower()
+              if value and not re.fullmatch(r"[0-9a-f]{64}", value):
+                  sys.exit(f"{name} is not a 64-character hex SHA-256")
+              return value
+
+
+          targets = [{"label": "ios16", "url": os.environ["IPA_URL"],
+                      "sha256": checksum("IPA_SHA256")}]
           second = os.environ.get("IPA_URL_IOS17", "").strip()
           if second:
-              targets.append({"label": "ios17", "url": second})
+              targets.append({"label": "ios17", "url": second,
+                              "sha256": checksum("IPA_SHA256_IOS17")})
           print("targets=" + json.dumps(targets))
           PY
 
   package:
     needs: [build, plan]
-    runs-on: macos-latest
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
@@ -58,7 +82,7 @@ jobs:
           name: YTKACE-deb-rootless
           path: packages
 
-      - uses: levibostian/action-hide-sensitive-inputs@v1
+      - uses: levibostian/action-hide-sensitive-inputs@39cfbde19b3251728d2357dd0648172d1202c1ee # v1.2.1
 
       - name: Setup
         run: brew install ldid dpkg
@@ -66,6 +90,7 @@ jobs:
       - name: YouTube
         env:
           IPA_URL: ${{ matrix.target.url }}
+          IPA_SHA256: ${{ matrix.target.sha256 }}
           GH_TOKEN: ${{ github.token }}
         run: |
           if [[ "$IPA_URL" == "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/"* ]]; then
@@ -76,6 +101,11 @@ jobs:
           else
             curl --fail --location "$IPA_URL" --output YouTube.ipa
           fi
+          if [[ -n "${IPA_SHA256:-}" ]]; then
+            echo "${IPA_SHA256}  YouTube.ipa" | shasum -a 256 -c -
+          else
+            echo "::warning::No SHA-256 provided for this IPA; skipping integrity check."
+          fi
           file_type=$(file --mime-type -b YouTube.ipa)
           if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
             exit 1
@@ -83,6 +113,8 @@ jobs:
 
       - name: Inject
         id: inject
+        env:
+          TARGET_LABEL: ${{ matrix.target.label }}
         run: |
           mkdir deb-root
           dpkg-deb -x packages/*.deb deb-root
@@ -98,7 +130,7 @@ jobs:
               print(plistlib.loads(archive.read(info))['CFBundleShortVersionString'])
           PY
           )"
-          if [ "${{ matrix.target.label }}" = "ios16" ]; then
+          if [ "$TARGET_LABEL" = "ios16" ]; then
             output="YTKACE_${tweak_version}_YouTube_iOS16_${youtube_version}.ipa"
           else
             output="YTKACE_${tweak_version}_YouTube_${youtube_version}.ipa"

@@ -13,3 +13,6 @@ DerivedData/
 __pycache__/
 *.pyc
 tmp/
+site/
+artifacts/
+deb-root/

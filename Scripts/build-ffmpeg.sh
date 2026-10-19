@@ -11,20 +11,62 @@ TOOLCHAIN="$THEOS/toolchain/linux/iphone/bin"
 if [[ ! -x "$TOOLCHAIN/clang" ]] || ! "$TOOLCHAIN/clang" --version >/dev/null 2>&1; then
     TOOLCHAIN="$(dirname "$(xcrun -sdk iphoneos -f clang)")"
 fi
-VERSION="${FFMPEG_VERSION:-8.1.2}"
+DEFAULT_VERSION="8.1.2"
+# SHA-256 of ffmpeg-8.1.2.tar.xz. ffmpeg.org only publishes GPG signatures, so
+# this value was cross-checked against two independent package managers that
+# verify the upstream tarball: Homebrew (ffmpeg@8 formula) and MacPorts
+# (ffmpeg8 Portfile, size 11710924 bytes).
+DEFAULT_SHA256="464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+VERSION="${FFMPEG_VERSION:-$DEFAULT_VERSION}"
+if [[ -z "${FFMPEG_SHA256:-}" && "$VERSION" == "$DEFAULT_VERSION" ]]; then
+    FFMPEG_SHA256="$DEFAULT_SHA256"
+fi
 MINOS="${FFMPEG_MIN_IOS:-15.0}"
 BUILD="$ROOT/.build/ffmpeg"
 SOURCE="$BUILD/ffmpeg-$VERSION"
 OUTPUT="$ROOT/Vendor/FFmpeg"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)}"
 
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
+
+verify_tarball() {
+    local file="$1"
+    if [[ -z "${FFMPEG_SHA256:-}" ]]; then
+        echo "WARNING: ************************************************************" >&2
+        echo "WARNING: No FFMPEG_SHA256 set for FFmpeg $VERSION." >&2
+        echo "WARNING: $file is NOT integrity-checked." >&2
+        echo "WARNING: Set FFMPEG_SHA256=<sha256 of ffmpeg-$VERSION.tar.xz> to verify it." >&2
+        echo "WARNING: ************************************************************" >&2
+        return 0
+    fi
+    local actual
+    actual="$(sha256_of "$file")"
+    if [[ "$actual" != "$(printf '%s' "$FFMPEG_SHA256" | tr 'A-F' 'a-f')" ]]; then
+        echo "error: SHA-256 mismatch for $file" >&2
+        echo "  expected: $FFMPEG_SHA256" >&2
+        echo "  actual:   $actual" >&2
+        rm -f "$file"
+        exit 1
+    fi
+    echo "Verified $file (sha256 $actual)"
+}
+
 mkdir -p "$BUILD" "$OUTPUT/lib"
-if [[ ! -f "$BUILD/ffmpeg-$VERSION.tar.xz" ]]; then
+TARBALL="$BUILD/ffmpeg-$VERSION.tar.xz"
+if [[ ! -f "$TARBALL" ]]; then
     curl -L --fail "https://ffmpeg.org/releases/ffmpeg-$VERSION.tar.xz" \
-        -o "$BUILD/ffmpeg-$VERSION.tar.xz"
+        -o "$TARBALL.part"
+    mv "$TARBALL.part" "$TARBALL"
 fi
+verify_tarball "$TARBALL"
 if [[ ! -d "$SOURCE" ]]; then
-    tar -xf "$BUILD/ffmpeg-$VERSION.tar.xz" -C "$BUILD"
+    tar -xf "$TARBALL" -C "$BUILD"
 fi
 
 build_arch() {
