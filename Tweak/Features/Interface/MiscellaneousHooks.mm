@@ -10,6 +10,7 @@
 #import <dlfcn.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <os/lock.h>
 #include <stdlib.h>
 
 static IMP OriginalAddInteraction;
@@ -17,7 +18,6 @@ static IMP OriginalSemanticContent;
 static IMP OriginalSetSemanticContent;
 static IMP OriginalCaptionTracks;
 static IMP OriginalCaptionControllerAlloc;
-static NSMutableDictionary<NSString *, NSValue *> *YTKACEMiscOriginals;
 static const void *YTKACECaptionTracksAssociation =
     &YTKACECaptionTracksAssociation;
 static const void *YTKACELastCaptionTrackAssociation =
@@ -25,6 +25,29 @@ static const void *YTKACELastCaptionTrackAssociation =
 static const void *YTKACEAppliedCaptionAssociation =
     &YTKACEAppliedCaptionAssociation;
 static NSHashTable *YTKACECaptionControllers;
+
+// Originals of hooked (Class, SEL) pairs. Hooks may run on any thread while
+// discovery adds entries on the main thread, so access is locked; lookups use
+// raw Class/SEL pointer keys (Class -> (SEL -> IMP)) so a hook call does not
+// format strings at every superclass step.
+static os_unfair_lock YTKACEMiscOriginalsLock = OS_UNFAIR_LOCK_INIT;
+static CFMutableDictionaryRef YTKACEMiscOriginals;
+
+static void YTKACEMiscSetOriginal(Class cls, SEL selector, IMP original) {
+    if (cls == Nil || selector == NULL || original == NULL) return;
+    os_unfair_lock_lock(&YTKACEMiscOriginalsLock);
+    if (YTKACEMiscOriginals == NULL) {
+        YTKACEMiscOriginals = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, NULL, NULL);
+    }
+    CFMutableDictionaryRef selectors = (CFMutableDictionaryRef)
+        CFDictionaryGetValue(YTKACEMiscOriginals, (__bridge void *)cls);
+    if (selectors == NULL) {
+        selectors = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, NULL, NULL);
+        CFDictionarySetValue(YTKACEMiscOriginals, (__bridge void *)cls, selectors);
+    }
+    CFDictionarySetValue(selectors, selector, (const void *)original);
+    os_unfair_lock_unlock(&YTKACEMiscOriginalsLock);
+}
 
 static NSString *YTKACECaptionTrackKey(id track) {
     if (track == nil) {
@@ -58,20 +81,21 @@ static BOOL YTKACECaptionRequestReceiver(id receiver, SEL selector) {
         [name containsString:@"hiddenonstart"];
 }
 
-static NSString *YTKACEMiscKey(Class cls, SEL selector) {
-    return [NSString stringWithFormat:@"%@|%@", NSStringFromClass(cls),
-                                      NSStringFromSelector(selector)];
-}
-
 static IMP YTKACEMiscOriginal(id receiver, SEL selector) {
-    for (Class cls = object_getClass(receiver); cls != Nil; cls = class_getSuperclass(cls)) {
-        IMP original = (IMP)[YTKACEMiscOriginals[
-            YTKACEMiscKey(cls, selector)] pointerValue];
-        if (original != NULL) {
-            return original;
+    IMP original = NULL;
+    os_unfair_lock_lock(&YTKACEMiscOriginalsLock);
+    if (YTKACEMiscOriginals != NULL) {
+        for (Class cls = object_getClass(receiver); cls != Nil;
+             cls = class_getSuperclass(cls)) {
+            CFDictionaryRef selectors = (CFDictionaryRef)
+                CFDictionaryGetValue(YTKACEMiscOriginals, (__bridge void *)cls);
+            if (selectors == NULL) continue;
+            original = (IMP)CFDictionaryGetValue(selectors, selector);
+            if (original != NULL) break;
         }
     }
-    return NULL;
+    os_unfair_lock_unlock(&YTKACEMiscOriginalsLock);
+    return original;
 }
 
 static BOOL YTKACEMiniPlayerEnabled(void) {
@@ -503,10 +527,7 @@ static void YTKACEStoreMiscOriginal(NSString *className,
                                     IMP original) {
     Class cls = NSClassFromString(className);
     if (cls != Nil && original != NULL) {
-        YTKACEMiscOriginals[YTKACEMiscKey(
-            cls,
-            NSSelectorFromString(selectorName)
-        )] = [NSValue valueWithPointer:(const void *)original];
+        YTKACEMiscSetOriginal(cls, NSSelectorFromString(selectorName), original);
     }
 }
 
@@ -755,8 +776,7 @@ void YTKACEInstallMiscellaneousHooks(void) {
             : ([defaults boolForKey:@"YTKACE.Preference.Playback.CaptionsAlwaysOn"] ? 1 : 0);
         if (legacy != 0) [defaults setInteger:legacy forKey:@"YTKACE.Preference.Playback.CaptionsMode"];
     }
-    if (YTKACEMiscOriginals == nil) {
-        YTKACEMiscOriginals = [NSMutableDictionary dictionary];
+    if (YTKACECaptionControllers == nil) {
         YTKACECaptionControllers = [NSHashTable weakObjectsHashTable];
     }
     YTKACEResolveForcedIdiom();

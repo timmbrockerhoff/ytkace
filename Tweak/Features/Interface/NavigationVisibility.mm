@@ -4,6 +4,7 @@
 
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <os/lock.h>
 #import <stdlib.h>
 
 static IMP OriginalHeaderLogoLayout;
@@ -19,7 +20,6 @@ static IMP OriginalNavigationImageSetImage;
 static IMP OriginalYTImageViewLayout;
 static IMP OriginalMainWindowTraitChanged;
 static IMP OriginalRightNavigationTraitChanged;
-static NSMutableDictionary<NSString *, NSValue *> *YTKACENavigationOriginals;
 static const void *YTKACENavigationHiddenAssociation = &YTKACENavigationHiddenAssociation;
 static BOOL YTKACENavigationObserverInstalled;
 static NSHashTable<UIView *> *YTKACENavigationOwners;
@@ -29,6 +29,29 @@ static void YTKACEApplyNavigationWindows(void);
 static void YTKACEApplyNavigationSelectors(id owner);
 static BOOL YTKACEInsideRightNavigation(UIView *view);
 static BOOL YTKACEIsNavigationIcon(UIView *view);
+
+// Originals of hooked (Class, SEL) pairs. Hooks may run on any thread while
+// discovery adds entries on the main thread, so access is locked; lookups use
+// raw Class/SEL pointer keys (Class -> (SEL -> IMP)) so a hook call does not
+// format strings at every superclass step.
+static os_unfair_lock YTKACENavigationOriginalsLock = OS_UNFAIR_LOCK_INIT;
+static CFMutableDictionaryRef YTKACENavigationOriginals;
+
+static void YTKACENavigationSetOriginal(Class cls, SEL selector, IMP original) {
+    if (cls == Nil || selector == NULL || original == NULL) return;
+    os_unfair_lock_lock(&YTKACENavigationOriginalsLock);
+    if (YTKACENavigationOriginals == NULL) {
+        YTKACENavigationOriginals = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, NULL, NULL);
+    }
+    CFMutableDictionaryRef selectors = (CFMutableDictionaryRef)
+        CFDictionaryGetValue(YTKACENavigationOriginals, (__bridge void *)cls);
+    if (selectors == NULL) {
+        selectors = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, NULL, NULL);
+        CFDictionarySetValue(YTKACENavigationOriginals, (__bridge void *)cls, selectors);
+    }
+    CFDictionarySetValue(selectors, selector, (const void *)original);
+    os_unfair_lock_unlock(&YTKACENavigationOriginalsLock);
+}
 
 static NSValue *YTKACENavigationIMPValue(IMP implementation) {
     return [NSValue value:&implementation withObjCType:@encode(IMP)];
@@ -40,19 +63,21 @@ static IMP YTKACENavigationIMP(NSValue *value) {
     return implementation;
 }
 
-static NSString *YTKACENavigationHookKey(Class cls, SEL selector) {
-    return [NSString stringWithFormat:@"%@|%@",
-            NSStringFromClass(cls), NSStringFromSelector(selector)];
-}
-
 static IMP YTKACENavigationOriginal(id receiver, SEL selector) {
-    for (Class cls = object_getClass(receiver); cls != Nil; cls = class_getSuperclass(cls)) {
-        NSValue *value = YTKACENavigationOriginals[
-            YTKACENavigationHookKey(cls, selector)
-        ];
-        if (value != nil) return YTKACENavigationIMP(value);
+    IMP original = NULL;
+    os_unfair_lock_lock(&YTKACENavigationOriginalsLock);
+    if (YTKACENavigationOriginals != NULL) {
+        for (Class cls = object_getClass(receiver); cls != Nil;
+             cls = class_getSuperclass(cls)) {
+            CFDictionaryRef selectors = (CFDictionaryRef)
+                CFDictionaryGetValue(YTKACENavigationOriginals, (__bridge void *)cls);
+            if (selectors == NULL) continue;
+            original = (IMP)CFDictionaryGetValue(selectors, selector);
+            if (original != NULL) break;
+        }
     }
-    return NULL;
+    os_unfair_lock_unlock(&YTKACENavigationOriginalsLock);
+    return original;
 }
 
 static void YTKACESetNavigationHidden(UIView *view, BOOL hidden) {
@@ -119,9 +144,6 @@ static id YTKACENavigationButton(id receiver, SEL selector) {
 }
 
 static void YTKACEInstallNavigationMethodHooks(void) {
-    if (YTKACENavigationOriginals == nil) {
-        YTKACENavigationOriginals = [NSMutableDictionary dictionary];
-    }
     NSString *version = NSBundle.mainBundle
         .infoDictionary[@"CFBundleShortVersionString"] ?: @"unknown";
     NSString *cacheKey =
@@ -156,9 +178,7 @@ static void YTKACEInstallNavigationMethodHooks(void) {
                 IMP hook = YTKACENavigationIMP(replacement);
                 IMP original = method_getImplementation(method);
                 if (original == hook) continue;
-                YTKACENavigationOriginals[
-                    YTKACENavigationHookKey(cls, selector)
-                ] = YTKACENavigationIMPValue(original);
+                YTKACENavigationSetOriginal(cls, selector, original);
                 method_setImplementation(method, hook);
             }
         };
