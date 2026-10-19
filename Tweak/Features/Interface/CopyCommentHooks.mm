@@ -6,6 +6,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <os/lock.h>
+#import <string.h>
 
 
 
@@ -17,6 +19,22 @@ static const void *YTKACEStoredCommentAssociation = &YTKACEStoredCommentAssociat
 static const void *YTKACECommentTextAssociation = &YTKACECommentTextAssociation;
 static const void *YTKACECommentNodeAssociation = &YTKACECommentNodeAssociation;
 static const void *YTKACECommentGestureAssociation = &YTKACECommentGestureAssociation;
+
+// Holds the comment node without retaining it: the node owns its view, so a
+// strong view -> node association would form a retain cycle and leak every
+// comment cell.
+@interface YTKACEWeakCommentNode : NSObject
+@property (nonatomic, weak) id node;
+@end
+
+@implementation YTKACEWeakCommentNode
+@end
+
+static id YTKACEAssociatedCommentNode(id view) {
+    YTKACEWeakCommentNode *box =
+        objc_getAssociatedObject(view, YTKACECommentNodeAssociation);
+    return [box isKindOfClass:YTKACEWeakCommentNode.class] ? box.node : nil;
+}
 
 static id YTKACEObjectMessage(id receiver, NSString *selectorName) {
     SEL selector = NSSelectorFromString(selectorName);
@@ -56,15 +74,17 @@ static NSString *YTKACECommentTextInNode(id node, NSUInteger depth) {
     if (stored.length != 0) {
         return stored;
     }
-    NSString *identifier = YTKACEObjectMessage(node, @"accessibilityIdentifier");
-    NSString *description = [node description];
     id attributedText = YTKACEObjectMessage(node, @"attributedText");
     NSString *text = YTKACECleanCommentText(
         YTKACEObjectMessage(attributedText, @"string")
     );
-    if (text.length != 0 && YTKACEIsCommentTextToken(
-        [NSString stringWithFormat:@"%@ %@", identifier ?: @"", description ?: @""])) {
-        return text;
+    if (text.length != 0) {
+        NSString *identifier = YTKACEObjectMessage(node, @"accessibilityIdentifier");
+        NSString *description = [node description];
+        if (YTKACEIsCommentTextToken([NSString stringWithFormat:@"%@ %@",
+                identifier ?: @"", description ?: @""])) {
+            return text;
+        }
     }
     NSArray *children = YTKACEObjectMessage(node, @"subnodes");
     if (![children isKindOfClass:NSArray.class]) {
@@ -109,7 +129,7 @@ static NSString *YTKACECommentTextInView(UIView *view, BOOL exact,
     if (ownText.length != 0 && (!exact || YTKACEIsCommentTextToken(token))) {
         return ownText;
     }
-    id node = objc_getAssociatedObject(view, YTKACECommentNodeAssociation);
+    id node = YTKACEAssociatedCommentNode(view);
     if (node == nil) {
         node = YTKACEObjectMessage(view, @"keepalive_node");
     }
@@ -162,7 +182,7 @@ static NSString *YTKACEStoredCommentForView(UIView *view) {
         if ([direct isKindOfClass:NSString.class] && direct.length != 0) {
             return direct;
         }
-        id node = objc_getAssociatedObject(candidate, YTKACECommentNodeAssociation);
+        id node = YTKACEAssociatedCommentNode(candidate);
         if (node == nil) node = YTKACEObjectMessage(candidate, @"keepalive_node");
         for (NSUInteger depth = 0; node != nil && depth < 14; depth++) {
             NSString *stored = objc_getAssociatedObject(
@@ -240,8 +260,14 @@ static void YTKACEAttachCommentGesture(UIView *view, id node) {
         return;
     }
     if (node != nil) {
-        objc_setAssociatedObject(view, YTKACECommentNodeAssociation,
-                                 node, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        YTKACEWeakCommentNode *box =
+            objc_getAssociatedObject(view, YTKACECommentNodeAssociation);
+        if (![box isKindOfClass:YTKACEWeakCommentNode.class]) {
+            box = [YTKACEWeakCommentNode new];
+            objc_setAssociatedObject(view, YTKACECommentNodeAssociation,
+                                     box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        box.node = node;
     }
     if (objc_getAssociatedObject(view, YTKACECommentGestureAssociation) != nil) {
         return;
@@ -264,15 +290,57 @@ static BOOL YTKACEIsCommentContainer(id node) {
            [description containsString:@"comment_reply"];
 }
 
-static NSString *YTKACENodeIdentifier(id node) {
+// Per-class facts for the ASDisplayNode setFrame: hook, which runs on every
+// layout pass of every node (possibly off the main thread).
+enum {
+    YTKACECommentClassKnown = 1 << 0,
+    YTKACECommentClassHasText = 1 << 1,
+    YTKACECommentClassNoKVCIdentifier = 1 << 2,
+};
+static os_unfair_lock YTKACECommentClassLock = OS_UNFAIR_LOCK_INIT;
+static CFMutableDictionaryRef YTKACECommentClassFlags;
+
+static uintptr_t YTKACECommentFlagsForClass(Class cls) {
+    os_unfair_lock_lock(&YTKACECommentClassLock);
+    uintptr_t flags = YTKACECommentClassFlags == NULL ? 0 :
+        (uintptr_t)CFDictionaryGetValue(YTKACECommentClassFlags, (__bridge void *)cls);
+    os_unfair_lock_unlock(&YTKACECommentClassLock);
+    if (flags != 0) return flags;
+    flags = YTKACECommentClassKnown;
+    if ([cls instancesRespondToSelector:@selector(attributedText)]) {
+        flags |= YTKACECommentClassHasText;
+    }
+    os_unfair_lock_lock(&YTKACECommentClassLock);
+    if (YTKACECommentClassFlags == NULL) {
+        YTKACECommentClassFlags = CFDictionaryCreateMutable(
+            kCFAllocatorDefault, 0, NULL, NULL);
+    }
+    CFDictionarySetValue(YTKACECommentClassFlags, (__bridge void *)cls, (void *)flags);
+    os_unfair_lock_unlock(&YTKACECommentClassLock);
+    return flags;
+}
+
+static void YTKACEMarkCommentClassFlag(Class cls, uintptr_t flag) {
+    uintptr_t flags = YTKACECommentFlagsForClass(cls) | flag;
+    os_unfair_lock_lock(&YTKACECommentClassLock);
+    CFDictionarySetValue(YTKACECommentClassFlags, (__bridge void *)cls, (void *)flags);
+    os_unfair_lock_unlock(&YTKACECommentClassLock);
+}
+
+static NSString *YTKACENodeIdentifier(id node, uintptr_t classFlags) {
     NSString *identifier = YTKACEObjectMessage(node, @"accessibilityIdentifier");
     if ([identifier isKindOfClass:NSString.class] && identifier.length != 0) {
         return identifier;
     }
+    // valueForKey: on a class without the key throws; remember such classes
+    // instead of throwing (and catching) an exception on every layout pass.
+    if (classFlags & YTKACECommentClassNoKVCIdentifier) return nil;
     @try {
         id value = [node valueForKey:@"_accessibilityIdentifier"];
         return [value isKindOfClass:NSString.class] ? value : nil;
     } @catch (__unused NSException *exception) {
+        YTKACEMarkCommentClassFlag(object_getClass(node),
+                                   YTKACECommentClassNoKVCIdentifier);
         return nil;
     }
 }
@@ -303,7 +371,11 @@ static void YTKACECommentNodeSetFrame(id receiver, SEL selector, CGRect frame) {
         ((void (*)(id, SEL, CGRect))OriginalCommentNodeSetFrame)(receiver, selector,
                                                                  frame);
     }
-    NSString *identifier = YTKACENodeIdentifier(receiver);
+    // Only text nodes can carry the comment text; skip everything else before
+    // looking at identifiers.
+    uintptr_t classFlags = YTKACECommentFlagsForClass(object_getClass(receiver));
+    if (!(classFlags & YTKACECommentClassHasText)) return;
+    NSString *identifier = YTKACENodeIdentifier(receiver, classFlags);
     if (identifier.length == 0) return;
     if (![identifier isEqualToString:@"id.comment.content.label"]) return;
     id attributed = YTKACEObjectMessage(receiver, @"attributedText");
@@ -317,17 +389,19 @@ static void YTKACECommentNodeDidLoad(id receiver, SEL selector) {
     if (OriginalCommentNodeDidLoad != NULL) {
         ((void (*)(id, SEL))OriginalCommentNodeDidLoad)(receiver, selector);
     }
-    NSString *identifier = YTKACEObjectMessage(receiver, @"accessibilityIdentifier");
-    NSString *token = [NSString stringWithFormat:@"%@ %@",
-        identifier ?: @"", [receiver description] ?: @""];
-    if (!YTKACEIsCommentTextToken(token)) {
-        return;
-    }
+    // Read the text first: it is cheap and empty for most nodes, while the
+    // node description is expensive to build.
     id attributedText = YTKACEObjectMessage(receiver, @"attributedText");
     NSString *text = YTKACECleanCommentText(
         YTKACEObjectMessage(attributedText, @"string")
     );
     if (text.length == 0) {
+        return;
+    }
+    NSString *identifier = YTKACEObjectMessage(receiver, @"accessibilityIdentifier");
+    NSString *token = [NSString stringWithFormat:@"%@ %@",
+        identifier ?: @"", [receiver description] ?: @""];
+    if (!YTKACEIsCommentTextToken(token)) {
         return;
     }
     objc_setAssociatedObject(receiver, YTKACECommentTextAssociation,
@@ -356,9 +430,8 @@ static void YTKACECommentViewSetNode(UIView *receiver, SEL selector, id node) {
     NSString *token = [NSString stringWithFormat:@"%@ %@ %@",
         NSStringFromClass(receiver.class) ?: @"",
         [receiver description] ?: @"", [node description] ?: @""];
-    NSString *text = YTKACECommentTextInNode(node, 0);
-    BOOL tokenMatch = YTKACEIsCommentToken(token);
-    if (tokenMatch || text.length != 0) {
+    // The subtree text search is only needed when the token did not match.
+    if (YTKACEIsCommentToken(token) || YTKACECommentTextInNode(node, 0).length != 0) {
         YTKACEAttachCommentGesture(receiver, node);
     }
 }
@@ -367,11 +440,16 @@ static void YTKACECommentUIViewDidMove(UIView *receiver, SEL selector) {
     if (OriginalCommentUIViewDidMove != NULL) {
         ((void (*)(id, SEL))OriginalCommentUIViewDidMove)(receiver, selector);
     }
-    NSString *token = [NSString stringWithFormat:@"%@ %@ %@",
-        NSStringFromClass(receiver.class) ?: @"",
-        receiver.accessibilityIdentifier ?: @"",
-        [receiver description] ?: @""];
-    if (YTKACEIsCommentToken(token)) {
+    // Runs for every view entering or leaving a window: match the class name
+    // and accessibility identifier directly instead of formatting and
+    // lowercasing the full view description. Texture views are covered by the
+    // setKeepalive_node: hook, which still inspects the node description.
+    const char *className = class_getName([receiver class]);
+    NSString *identifier = receiver.accessibilityIdentifier;
+    if ((className != NULL && strcasestr(className, "comment") != NULL) ||
+        (identifier.length != 0 &&
+         [identifier rangeOfString:@"comment"
+                           options:NSCaseInsensitiveSearch].location != NSNotFound)) {
         YTKACEAttachCommentGesture(receiver,
             YTKACEObjectMessage(receiver, @"keepalive_node"));
     }

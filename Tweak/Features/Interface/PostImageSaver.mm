@@ -307,7 +307,10 @@ static void YTKACEAttachPostCopyGestures(void) {
 void YTKACEInstallPostImageSaverHooks(void) {
     for (NSNotificationName name in @[UIApplicationDidBecomeActiveNotification, YTKACEPreferencesDidChangeNotification]) {
         [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue
-                                                    usingBlock:^(__unused NSNotification *note) {
+                                                    usingBlock:^(NSNotification *note) {
+            // Only the copy-text preference affects the window gestures.
+            if ([note.name isEqualToString:YTKACEPreferencesDidChangeNotification] &&
+                ![note.userInfo[@"key"] isEqual:YTKACEPostCopyTextKey]) return;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(),
                            ^{ YTKACEAttachPostCopyGestures(); });
         }];

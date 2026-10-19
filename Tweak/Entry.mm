@@ -68,6 +68,7 @@ static void YTKACEEntryPoint(void) {
     @autoreleasepool {
         YTKACEClearDownloadLog();
         YTKACERegisterDefaults();
+        YTKACEScheduleStartupMaintenance();
         YTKACEScheduleFirstLaunch();
         YTKACEInstallModules();
     }

@@ -32,5 +32,11 @@ FOUNDATION_EXPORT id _Nullable YTKACEPreferenceObject(NSString *key);
 FOUNDATION_EXPORT void YTKACESetPreferenceObject(NSString *key, id _Nullable value);
 FOUNDATION_EXPORT NSURL *YTKACEApplicationSupportDirectory(void);
 FOUNDATION_EXPORT NSUInteger YTKACEPurgeSystemCaches(void);
+// Repairs the downloads layout (once per tweak version) and purges stale
+// scratch files on a utility queue shortly after launch.
+FOUNDATION_EXPORT void YTKACEScheduleStartupMaintenance(void);
+// Changes whenever any preference may have changed; lets callers cache values
+// derived from several preferences.
+FOUNDATION_EXPORT uint64_t YTKACEPreferenceGeneration(void);
 
 NS_ASSUME_NONNULL_END

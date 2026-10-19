@@ -9,6 +9,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <string.h>
 
 static IMP OriginalSetPivotRenderer;
 static IMP OriginalPivotItemLayout;
@@ -699,22 +700,20 @@ static void YTKACESetLabelsHidden(UIView *view, BOOL hidden) {
     }
 }
 
-static BOOL YTKACEInsidePivotItem(UIView *view) {
-    for (UIView *current = view.superview; current != nil; current = current.superview) {
-        if ([NSStringFromClass(current.class) containsString:@"PivotBarItemView"]) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
+// These run from app-wide UILabel hooks, so match the class name as a C
+// string instead of allocating an NSString per ancestor.
 static UIView *YTKACEPivotItemAncestor(UIView *view) {
     for (UIView *current = view.superview; current != nil; current = current.superview) {
-        if ([NSStringFromClass(current.class) containsString:@"PivotBarItemView"]) {
+        const char *name = class_getName([current class]);
+        if (name != NULL && strstr(name, "PivotBarItemView") != NULL) {
             return current;
         }
     }
     return nil;
+}
+
+static BOOL YTKACEInsidePivotItem(UIView *view) {
+    return YTKACEPivotItemAncestor(view) != nil;
 }
 
 static void YTKACEPivotLabelSetHidden(UILabel *receiver,
@@ -1328,21 +1327,26 @@ static BOOL YTKACEContainsCreateText(NSString *value) {
         [text containsString:@"add video"];
 }
 
-static void YTKACEHideCreateViews(UIView *view) {
-    BOOL hideCreate = [NSUserDefaults.standardUserDefaults boolForKey:@"YTKACE.Preference.Tabs.Hidden.Create"];
+static void YTKACEHideCreateSubviews(UIView *view) {
     for (UIView *subview in view.subviews) {
         NSString *label = subview.accessibilityLabel;
         NSString *identifier = subview.accessibilityIdentifier;
         NSString *className = NSStringFromClass(subview.class);
-        if (hideCreate &&
-            (YTKACEContainsCreateText(label) ||
-             YTKACEContainsCreateText(identifier) ||
-             YTKACEContainsCreateText(className))) {
+        if (YTKACEContainsCreateText(label) ||
+            YTKACEContainsCreateText(identifier) ||
+            YTKACEContainsCreateText(className)) {
             subview.hidden = YES;
             subview.userInteractionEnabled = NO;
         }
-        YTKACEHideCreateViews(subview);
+        YTKACEHideCreateSubviews(subview);
     }
+}
+
+// Runs on every pivot bar layout; with the option off the walk does nothing,
+// so skip it (and read the preference once, not once per subview).
+static void YTKACEHideCreateViews(UIView *view) {
+    if (!YTKACEFeatureEnabled(@"YTKACE.Preference.Tabs.Hidden.Create")) return;
+    YTKACEHideCreateSubviews(view);
 }
 
 static IMP YTKACEOrigInfoDictionary;
