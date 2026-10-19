@@ -1259,12 +1259,19 @@ void YTKACEReloadPlayer(NSString * _Nullable videoID,
         Class playbackClass = NSClassFromString(@"YTPlaybackRequest");
         SEL initializer = NSSelectorFromString(
             @"initWithProtoRequest:URLRequestProperties:CPN:QOEController:latencyLogger:streamingWatchEnabled:enablePlayerResponseCacheKeyRelaxation:playerResponseCacheToken:streamingWatchHandlers:");
-        id allocated = [playbackClass alloc];
+        SEL streamingGetter = NSSelectorFromString(@"streamingWatchEnabled");
+        SEL relaxationGetter =
+            NSSelectorFromString(@"enablePlayerResponseCacheKeyRelaxation");
+        // Both getters are messaged unchecked below; an unrecognized selector
+        // would crash, so fall back to the player route when they are missing.
+        id allocated = [playbackRequest respondsToSelector:streamingGetter] &&
+            [playbackRequest respondsToSelector:relaxationGetter]
+            ? [playbackClass alloc] : nil;
         if ([allocated respondsToSelector:initializer]) {
             BOOL streaming = ((BOOL (*)(id, SEL))objc_msgSend)(
-                playbackRequest, NSSelectorFromString(@"streamingWatchEnabled"));
+                playbackRequest, streamingGetter);
             BOOL relaxation = ((BOOL (*)(id, SEL))objc_msgSend)(
-                playbackRequest, NSSelectorFromString(@"enablePlayerResponseCacheKeyRelaxation"));
+                playbackRequest, relaxationGetter);
             routedRequest = ((id (*)(id, SEL, id, id, id, id, id, BOOL, BOOL, id, id))objc_msgSend)(
                 allocated,
                 initializer,
@@ -1299,11 +1306,16 @@ void YTKACEReloadPlayer(NSString * _Nullable videoID,
                 service, NSSelectorFromString(@"makePlaybackRequest:responseBlock:errorBlock:"),
                 routedRequest, response, failure
             );
-        } else {
+        } else if (OriginalMakePlayerRequest != NULL) {
             ((void (*)(id, SEL, id, id, id))OriginalMakePlayerRequest)(
                 service, NSSelectorFromString(@"makePlayerRequest:responseBlock:errorBlock:"),
                 mutableRequest, response, failure
             );
+        } else {
+            // Only the playback route is hooked but it could not be built.
+            failure([NSError errorWithDomain:@"YTKACEPlayerReload" code:3
+                userInfo:@{NSLocalizedDescriptionKey:
+                    @"YouTube's player service is unavailable."}]);
         }
     });
 }
