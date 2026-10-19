@@ -5,6 +5,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <os/lock.h>
+#import <stdlib.h>
 
 static IMP OriginalShouldBlockUpgradeDialog;
 static IMP OriginalAdShieldSignals;
@@ -326,14 +328,88 @@ static BOOL YTKACEIsAdLayoutIdentifier(NSString *identifier) {
     return [normalized hasPrefix:@"eml_ad_"];
 }
 
-static BOOL YTKACEObjectLooksLikeAd(id object) {
-    if (object == nil) return NO;
-    if ([objc_getAssociatedObject(object, YTKACEAdMatchAssociation) boolValue]) {
-        return YES;
-    }
-    BOOL matched = NO;
+// Per-class answers to the respondsToSelector: checks below. Contents arrays
+// are filtered every time they are read and almost every object checked is
+// not an ad, so the ~50 capability checks were repeated for the same classes
+// over and over. Only the capability checks are cached; the getters are still
+// called on every object, so what counts as an ad is unchanged.
+static const char *const YTKACEAdBoolSelectorNames[] = {
+    "isAdRenderer",
+    "isAd",
+    "hasAdLoggingData",
+    "hasAdBadgeRenderer",
+    "hasNativeAdBadgeRenderer",
+    "hasSimpleAdBadgeRenderer",
+    "hasAdSlotRenderer",
+    "hasCompanionAdRenderer",
+    "hasCompactCompanionAdRenderer",
+    "hasMultiItemCompanionAdRenderer",
+    "hasAppPromoCompanionAdRenderer",
+    "hasShoppingCompanionAdRenderer",
+    "hasSuggestedVideosCompanionAdRenderer",
+    "hasCompactPromotedBannerRenderer",
+    "hasCompactPromotedItemRenderer",
+    "hasCompactPromotedVideoRenderer",
+    "hasGridPromotedBannerRenderer",
+    "hasGridPromotedVideoRenderer",
+    "hasPromoted15ClickPtTextCtdWatchRenderer",
+    "hasPromoted15ClickPtTextWatchRenderer",
+    "hasPromoted15ClickTextCtdWatchRenderer",
+    "hasPromoted15ClickTextWatchRenderer",
+    "hasPromotedAppInstallRenderer",
+    "hasPromotedDiscoveryAppPromoCompactFormRenderer",
+    "hasPromotedSparklesTextCtdHomeCompactFormRenderer",
+    "hasPromotedSparklesTextCtdHomeRenderer",
+    "hasPromotedSparklesTextCtdWatch15ClickRenderer",
+    "hasPromotedSparklesTextCtdWatchGridFormRenderer",
+    "hasPromotedSparklesTextCtdWatchWideFormRenderer",
+    "hasPromotedSparklesTextHomeRenderer",
+    "hasPromotedSparklesTextProductHomeRenderer",
+    "hasPromotedSparklesTextProductWatchRenderer",
+    "hasPromotedSparklesTextSearchRenderer",
+    "hasPromotedSparklesTextWatch15ClickRenderer",
+    "hasPromotedSparklesTextWatchGridFormRenderer",
+    "hasPromotedSparklesTextWatchWideFormRenderer",
+    "hasPromotedTextBannerRenderer",
+    "hasPromotedVideoInlineMutedRenderer",
+    "hasPromotedVideoRenderer",
+    "hasShoppingAdInfoCardContentRenderer"
+};
+static const NSUInteger YTKACEAdBoolSelectorCount =
+    sizeof(YTKACEAdBoolSelectorNames) / sizeof(YTKACEAdBoolSelectorNames[0]);
+static const NSUInteger YTKACEAdHasAdLoggingDataIndex = 2;
+
+enum {
+    YTKACEAdValueAdLoggingData = 0,
+    YTKACEAdValueBadgeFirst = 1,      // adBadgeRenderer .. simpleAdBadgeRenderer
+    YTKACEAdValueBadgeCount = 3,
+    YTKACEAdValueIdentifierFirst = 4, // identifier .. templateIdentifier
+    YTKACEAdValueIdentifierCount = 5,
+    YTKACEAdValueCompatibilityOptions = 9,
+    YTKACEAdValueSelectorCount = 10,
+};
+static const char *const YTKACEAdValueSelectorNames[YTKACEAdValueSelectorCount] = {
+    "adLoggingData",
+    "adBadgeRenderer", "nativeAdBadgeRenderer", "simpleAdBadgeRenderer",
+    "identifier", "layoutIdentifier", "elementIdentifier",
+    "accessibilityIdentifier", "templateIdentifier",
+    "compatibilityOptions",
+};
+
+typedef struct {
+    BOOL nameMatch;
+    uint64_t boolMask;
+    uint32_t valueMask;
+} YTKACEAdClassProfile;
+
+static SEL YTKACEAdBoolSelectors[64];
+static SEL YTKACEAdValueSelectors[YTKACEAdValueSelectorCount];
+static os_unfair_lock YTKACEAdProfileLock = OS_UNFAIR_LOCK_INIT;
+static CFMutableDictionaryRef YTKACEAdProfiles;
+
+static BOOL YTKACEAdClassNameMatches(id object) {
     NSString *className = NSStringFromClass([object class]).lowercaseString;
-    if ([className containsString:@"adrenderer"] ||
+    return [className containsString:@"adrenderer"] ||
         ([className containsString:@"promoted"] &&
          [className containsString:@"renderer"]) ||
         [className containsString:@"promorenderer"] ||
@@ -341,82 +417,107 @@ static BOOL YTKACEObjectLooksLikeAd(id object) {
         [className containsString:@"companionadrenderer"] ||
         [className containsString:@"shoppingadinfocardcontentrenderer"] ||
         [className containsString:@"infeedad"] ||
-        [className containsString:@"displayad"]) {
-        matched = YES;
+        [className containsString:@"displayad"];
+}
+
+static YTKACEAdClassProfile YTKACEAdProfileForObject(id object) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        for (NSUInteger index = 0; index < YTKACEAdBoolSelectorCount; index++) {
+            YTKACEAdBoolSelectors[index] =
+                sel_registerName(YTKACEAdBoolSelectorNames[index]);
+        }
+        for (NSUInteger index = 0; index < YTKACEAdValueSelectorCount; index++) {
+            YTKACEAdValueSelectors[index] =
+                sel_registerName(YTKACEAdValueSelectorNames[index]);
+        }
+    });
+    Class cls = object_getClass(object);
+    YTKACEAdClassProfile profile = {NO, 0, 0};
+    os_unfair_lock_lock(&YTKACEAdProfileLock);
+    const YTKACEAdClassProfile *stored = YTKACEAdProfiles == NULL ? NULL :
+        (const YTKACEAdClassProfile *)CFDictionaryGetValue(YTKACEAdProfiles,
+                                                           (__bridge void *)cls);
+    if (stored != NULL) profile = *stored;
+    os_unfair_lock_unlock(&YTKACEAdProfileLock);
+    if (stored != NULL) return profile;
+
+    profile.nameMatch = YTKACEAdClassNameMatches(object);
+    for (NSUInteger index = 0; index < YTKACEAdBoolSelectorCount; index++) {
+        if ([object respondsToSelector:YTKACEAdBoolSelectors[index]]) {
+            profile.boolMask |= (uint64_t)1 << index;
+        }
     }
-    for (NSString *selectorName in @[@"isAdRenderer", @"isAd",
-                                      @"hasAdLoggingData",
-                                      @"hasAdBadgeRenderer",
-                                      @"hasNativeAdBadgeRenderer",
-                                      @"hasSimpleAdBadgeRenderer",
-                                      @"hasAdSlotRenderer",
-                                      @"hasCompanionAdRenderer",
-                                      @"hasCompactCompanionAdRenderer",
-                                      @"hasMultiItemCompanionAdRenderer",
-                                      @"hasAppPromoCompanionAdRenderer",
-                                      @"hasShoppingCompanionAdRenderer",
-                                      @"hasSuggestedVideosCompanionAdRenderer",
-                                      @"hasCompactPromotedBannerRenderer",
-                                      @"hasCompactPromotedItemRenderer",
-                                      @"hasCompactPromotedVideoRenderer",
-                                      @"hasGridPromotedBannerRenderer",
-                                      @"hasGridPromotedVideoRenderer",
-                                      @"hasPromoted15ClickPtTextCtdWatchRenderer",
-                                      @"hasPromoted15ClickPtTextWatchRenderer",
-                                      @"hasPromoted15ClickTextCtdWatchRenderer",
-                                      @"hasPromoted15ClickTextWatchRenderer",
-                                      @"hasPromotedAppInstallRenderer",
-                                      @"hasPromotedDiscoveryAppPromoCompactFormRenderer",
-                                      @"hasPromotedSparklesTextCtdHomeCompactFormRenderer",
-                                      @"hasPromotedSparklesTextCtdHomeRenderer",
-                                      @"hasPromotedSparklesTextCtdWatch15ClickRenderer",
-                                      @"hasPromotedSparklesTextCtdWatchGridFormRenderer",
-                                      @"hasPromotedSparklesTextCtdWatchWideFormRenderer",
-                                      @"hasPromotedSparklesTextHomeRenderer",
-                                      @"hasPromotedSparklesTextProductHomeRenderer",
-                                      @"hasPromotedSparklesTextProductWatchRenderer",
-                                      @"hasPromotedSparklesTextSearchRenderer",
-                                      @"hasPromotedSparklesTextWatch15ClickRenderer",
-                                      @"hasPromotedSparklesTextWatchGridFormRenderer",
-                                      @"hasPromotedSparklesTextWatchWideFormRenderer",
-                                      @"hasPromotedTextBannerRenderer",
-                                      @"hasPromotedVideoInlineMutedRenderer",
-                                      @"hasPromotedVideoRenderer",
-                                      @"hasShoppingAdInfoCardContentRenderer"]) {
+    for (NSUInteger index = 0; index < YTKACEAdValueSelectorCount; index++) {
+        if ([object respondsToSelector:YTKACEAdValueSelectors[index]]) {
+            profile.valueMask |= (uint32_t)1 << index;
+        }
+    }
+    YTKACEAdClassProfile *entry =
+        (YTKACEAdClassProfile *)malloc(sizeof(YTKACEAdClassProfile));
+    if (entry == NULL) return profile;
+    *entry = profile;
+    os_unfair_lock_lock(&YTKACEAdProfileLock);
+    if (YTKACEAdProfiles == NULL) {
+        YTKACEAdProfiles = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, NULL, NULL);
+    }
+    if (CFDictionaryGetValue(YTKACEAdProfiles, (__bridge void *)cls) == NULL) {
+        CFDictionarySetValue(YTKACEAdProfiles, (__bridge void *)cls, entry);
+        entry = NULL;
+    }
+    os_unfair_lock_unlock(&YTKACEAdProfileLock);
+    free(entry);
+    return profile;
+}
+
+static id YTKACEAdProfileValue(id object, const YTKACEAdClassProfile *profile,
+                               NSUInteger index) {
+    if (!(profile->valueMask & ((uint32_t)1 << index))) return nil;
+    @try {
+        return ((id (*)(id, SEL))objc_msgSend)(object, YTKACEAdValueSelectors[index]);
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+static BOOL YTKACEObjectLooksLikeAd(id object) {
+    if (object == nil) return NO;
+    if ([objc_getAssociatedObject(object, YTKACEAdMatchAssociation) boolValue]) {
+        return YES;
+    }
+    YTKACEAdClassProfile profile = YTKACEAdProfileForObject(object);
+    BOOL matched = profile.nameMatch;
+    for (NSUInteger index = 0; index < YTKACEAdBoolSelectorCount; index++) {
         if (matched) break;
-        SEL selector = NSSelectorFromString(selectorName);
-        if ([object respondsToSelector:selector] &&
-            ((BOOL (*)(id, SEL))objc_msgSend)(object, selector)) {
+        if ((profile.boolMask & ((uint64_t)1 << index)) &&
+            ((BOOL (*)(id, SEL))objc_msgSend)(object, YTKACEAdBoolSelectors[index])) {
             matched = YES;
         }
     }
-    if (!matched && YTKACEObjectValue(object, @"adLoggingData") != nil) {
+    if (!matched &&
+        YTKACEAdProfileValue(object, &profile, YTKACEAdValueAdLoggingData) != nil) {
         matched = YES;
     }
-    for (NSString *selectorName in @[
-        @"adBadgeRenderer", @"nativeAdBadgeRenderer",
-        @"simpleAdBadgeRenderer"
-    ]) {
+    for (NSUInteger index = YTKACEAdValueBadgeFirst;
+         index < YTKACEAdValueBadgeFirst + YTKACEAdValueBadgeCount; index++) {
         if (matched) break;
-        id value = YTKACEObjectValue(object, selectorName);
-        if (value != nil) {
+        if (YTKACEAdProfileValue(object, &profile, index) != nil) {
             matched = YES;
         }
     }
-    for (NSString *selectorName in @[
-        @"identifier", @"layoutIdentifier", @"elementIdentifier",
-        @"accessibilityIdentifier", @"templateIdentifier"
-    ]) {
+    for (NSUInteger index = YTKACEAdValueIdentifierFirst;
+         index < YTKACEAdValueIdentifierFirst + YTKACEAdValueIdentifierCount; index++) {
         if (matched) break;
-        id value = YTKACEObjectValue(object, selectorName);
+        id value = YTKACEAdProfileValue(object, &profile, index);
         if ([value isKindOfClass:NSString.class] &&
             YTKACEIsAdLayoutIdentifier(value)) {
             matched = YES;
         }
     }
     if (!matched) {
-        id options = YTKACEObjectValue(object, @"compatibilityOptions");
-        SEL loggingSelector = NSSelectorFromString(@"hasAdLoggingData");
+        id options = YTKACEAdProfileValue(object, &profile,
+                                          YTKACEAdValueCompatibilityOptions);
+        SEL loggingSelector = YTKACEAdBoolSelectors[YTKACEAdHasAdLoggingDataIndex];
         matched = [options respondsToSelector:loggingSelector] &&
             ((BOOL (*)(id, SEL))objc_msgSend)(options, loggingSelector);
     }
