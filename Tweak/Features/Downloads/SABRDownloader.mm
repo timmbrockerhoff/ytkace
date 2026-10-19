@@ -73,12 +73,14 @@ void YTKACESABRRestoreSeed(void) {
     NSDictionary *seed = [NSPropertyListSerialization
         propertyListWithData:encoded options:NSPropertyListImmutable
                       format:NULL error:NULL];
+    if (![seed isKindOfClass:NSDictionary.class]) return;
     NSData *body = seed[@"body"];
     NSDictionary *headers = seed[@"headers"];
     if (![body isKindOfClass:NSData.class]) return;
+    if (![headers isKindOfClass:NSDictionary.class]) headers = nil;
     @synchronized (YTKACESABRDownloader.class) {
         YTKACESABRNativeBody = [body copy];
-        if ([headers isKindOfClass:NSDictionary.class] && headers.count != 0) {
+        if (headers.count != 0) {
             YTKACESABRNativeHeaders = [headers copy];
         }
     }
@@ -111,11 +113,6 @@ void YTKACESABRSetNativeHeaders(NSDictionary<NSString *, NSString *> *headers) {
             }
             YTKACESABRHeadersByVideo[YTKACESABRCurrentVideoID] = [headers copy];
         }
-    }
-    NSMutableArray<NSString *> *summary = [NSMutableArray array];
-    for (NSString *key in headers) {
-        [summary addObject:[NSString stringWithFormat:@"%@:%lu", key,
-            (unsigned long)[headers[key] length]]];
     }
 }
 
@@ -503,7 +500,7 @@ static NSMutableDictionary<NSString *, NSDictionary *> *YTKACESABRStandalone;
 void YTKACESABRSetStandaloneClient(NSString *identifier, NSData *clientInfo,
                                    NSDictionary<NSString *, NSString *> *headers) {
     if (identifier.length == 0) return;
-    @synchronized (NSStringFromClass(YTKACESABRDownloader.class)) {
+    @synchronized (YTKACESABRDownloader.class) {
         if (YTKACESABRStandalone == nil) YTKACESABRStandalone = [NSMutableDictionary dictionary];
         if (clientInfo == nil) [YTKACESABRStandalone removeObjectForKey:identifier];
         else YTKACESABRStandalone[identifier] = @{@"client": clientInfo, @"headers": headers ?: @{}};
@@ -512,7 +509,7 @@ void YTKACESABRSetStandaloneClient(NSString *identifier, NSData *clientInfo,
 
 static NSDictionary *YTKACESABRStandaloneFor(NSString *identifier) {
     if (identifier.length == 0) return nil;
-    @synchronized (NSStringFromClass(YTKACESABRDownloader.class)) {
+    @synchronized (YTKACESABRDownloader.class) {
         return YTKACESABRStandalone[identifier];
     }
 }
@@ -628,6 +625,13 @@ static NSData *YTKACESABRClientInfo(void) {
 @property(nonatomic, assign) BOOL triedTVClient;
 @property(nonatomic, assign) NSInteger tvRefreshCount;
 @property(nonatomic, assign) NSInteger nativeBuildFailures;
+// Serial queue that owns all session state: the URLSession delegate queue runs on it and
+// every timer / external callback hops onto it before touching the session.
+@property(nonatomic, strong) dispatch_queue_t queue;
+@property(nonatomic, assign) BOOL started;
+@property(nonatomic, assign) BOOL waitingForNative;
+@property(nonatomic, assign) NSTimeInterval retryAfterSeconds;
+@property(nonatomic, strong, nullable) NSData *clientInfo;
 - (void)start;
 - (void)cancel;
 - (void)sendPreparedRequest:(NSURLRequest * _Nullable)nativeRequest
@@ -641,6 +645,24 @@ static NSData *YTKACESABRClientInfo(void) {
 @end
 
 @implementation YTKACESABRSession
+
+- (void)perform:(dispatch_block_t)block {
+    dispatch_async(self.queue, block);
+}
+
+- (void)perform:(dispatch_block_t)block after:(NSTimeInterval)delay {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(delay, 0.0) * NSEC_PER_SEC)),
+        self.queue, block);
+}
+
+// Wraps a player callback (delivered on main or on the caller's thread) so it runs on self.queue.
+- (YTKACEPlayerReloadCompletion)onQueue:(YTKACEPlayerReloadCompletion)completion {
+    __weak YTKACESABRSession *weakSelf = self;
+    return ^(id playerResponse, NSError *error) {
+        YTKACESABRSession *strongSelf = weakSelf;
+        [strongSelf perform:^{ completion(playerResponse, error); }];
+    };
+}
 
 - (NSError *)error:(NSString *)message code:(NSInteger)code {
     return [NSError errorWithDomain:YTKACESABRErrorDomain code:code
@@ -843,7 +865,8 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
     if (nativeContext.length != 0) {
         [context appendData:nativeContext];
     } else {
-        YTKACEPBBytes(context, 1, standalone ? standalone[@"client"] : YTKACESABRClientInfo());
+        YTKACEPBBytes(context, 1, standalone ? standalone[@"client"]
+                                             : (self.clientInfo ?: YTKACESABRClientInfo()));
         NSData *poToken = standalone ? nil : YTKACESABRCurrentPoToken();
         if (poToken.length != 0) {
             YTKACEPBBytes(context, 2, poToken);
@@ -884,11 +907,14 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
     [self clearRound:self.video];
     [self clearRound:self.audio];
     if (self.requestNumber == 0) {
-        NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ytkace-outgoing.pb"];
-        [request writeToFile:path atomically:YES];
+        NSString *path = nil;
+        if (YTKACEDebugLogsEnabled()) {
+            path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ytkace-outgoing.pb"];
+            [request writeToFile:path atomically:YES];
+        }
         YTKACEDownloadLog(self.identifier, @"request fields native=%lu outgoing=%lu summary=%@ dump=%@",
             (unsigned long)nativeBody.length, (unsigned long)request.length,
-            YTKACEPBFieldSummary(request), path);
+            YTKACEPBFieldSummary(request), path ?: @"off");
     }
     return request;
 }
@@ -908,7 +934,9 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
 }
 
 - (void)start {
-    if (self.finished) return;
+    // Runs on self.queue. The wait for the native player body is a single polling chain
+    // (waitForNativeSession); the transfer itself is set up exactly once (beginTransfer).
+    if (self.finished || self.started || self.waitingForNative) return;
     if (!self.triedTVClient && YTKACETVDownloadsEnabled()) {
         __weak YTKACESABRSession *weakSelf = self;
         [self switchToTVClient:@"preference" then:^(__unused BOOL switched) {
@@ -923,6 +951,12 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
             return;
         }
     }
+    self.waitingForNative = YES;
+    [self waitForNativeSession];
+}
+
+- (void)waitForNativeSession {
+    if (self.finished || self.started) return;
     if (!self.usingTVClient &&
         YTKACESABRCurrentNativeBody(self.videoID, self.ustreamerConfig).length == 0) {
         if (self.preparationAttempts == 0) {
@@ -935,7 +969,7 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
             self.preparationInFlight = YES;
             self.lastPreparationRequest = now;
             __weak YTKACESABRSession *weakSelf = self;
-            YTKACEPreparePlayer(self.videoID, ^(id playerResponse, NSError *prepareError) {
+            YTKACEPreparePlayer(self.videoID, [self onQueue:^(id playerResponse, NSError *prepareError) {
                 YTKACESABRSession *strongSelf = weakSelf;
                 if (strongSelf == nil || strongSelf.finished) return;
                 strongSelf.preparationInFlight = NO;
@@ -947,8 +981,8 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
                     @"prepare result=%@ error=%@",
                     playerResponse != nil ? @"response" : @"none",
                     prepareError.localizedDescription ?: @"none");
-                dispatch_async(dispatch_get_main_queue(), ^{ [strongSelf start]; });
-            });
+                // The single polling chain picks the new body up; it is not restarted here.
+            }]);
         }
         self.preparationAttempts += 1;
         if (self.preparationAttempts > 300) {
@@ -957,12 +991,24 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
                 code:10]];
             return;
         }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
-            dispatch_get_main_queue(), ^{ [self start]; });
+        [self perform:^{ [self waitForNativeSession]; } after:0.1];
         return;
     }
+    self.waitingForNative = NO;
+    [self beginTransfer];
+}
+
+- (void)beginTransfer {
+    if (self.finished || self.started) return;
+    self.started = YES;
     YTKACEDownloadLog(self.identifier, @"native ready video=%@ wait=%ld",
         self.videoID, (long)self.preparationAttempts);
+    int64_t required = MAX((int64_t)self.audio.option.contentLength, 0) +
+        (self.audioOnly ? 0 : MAX((int64_t)self.video.option.contentLength, 0));
+    if (!YTKACEDownloadHasFreeSpace(required)) {
+        [self fail:YTKACEDownloadStorageError(nil)];
+        return;
+    }
     NSError *error = nil;
     if (![self prepare:&error]) {
         [self fail:error ?: [self error:@"SABR setup failed." code:2]];
@@ -982,6 +1028,7 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
     NSOperationQueue *queue = [NSOperationQueue new];
     queue.maxConcurrentOperationCount = 1;
     queue.qualityOfService = NSQualityOfServiceUtility;
+    queue.underlyingQueue = self.queue;
     self.session = [NSURLSession sessionWithConfiguration:configuration
         delegate:self delegateQueue:queue];
     NSString *serverHost = [NSURL URLWithString:self.serverURL].host ?: @"unknown";
@@ -1094,7 +1141,7 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
     YTKACEDownloadLog(self.identifier, @"native refresh attempt=%ld reason=%@",
         (long)self.nativeRefreshAttempts, reason ?: @"authorization");
     __weak YTKACESABRSession *weakSelf = self;
-    YTKACEPreparePlayer(self.videoID, ^(id playerResponse, NSError *error) {
+    YTKACEPreparePlayer(self.videoID, [self onQueue:^(id playerResponse, NSError *error) {
         YTKACESABRSession *strongSelf = weakSelf;
         if (strongSelf == nil || strongSelf.finished) return;
         strongSelf.nativeRefreshInFlight = NO;
@@ -1113,7 +1160,7 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
         [strongSelf.contexts removeAllObjects];
         [strongSelf.headers removeAllObjects];
         [strongSelf sendRequest];
-    });
+    }]);
 }
 
 - (void)switchToTVClient:(NSString *)reason then:(void (^)(BOOL switched))next {
@@ -1143,7 +1190,9 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
     }
     __weak YTKACESABRSession *weakSelf = self;
     YTKACETVFetchPlayerResponse(self.videoID, ^(id response, NSString *visitor, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
+        YTKACESABRSession *session = weakSelf;
+        if (session == nil) return;
+        [session perform:^{
             YTKACESABRSession *strongSelf = weakSelf;
             if (strongSelf == nil || strongSelf.finished) return;
             NSError *applyError = nil;
@@ -1172,7 +1221,7 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
             YTKACEDownloadLog(strongSelf.identifier, @"tv client active host=%@",
                 [NSURL URLWithString:strongSelf.serverURL].host);
             next(YES);
-        });
+        }];
     });
 }
 
@@ -1215,11 +1264,11 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
     YTKACEDownloadLog(self.identifier, @"authorization recovery step=%ld wait=%.0f route=player",
         (long)self.authRecoveryStep, wait);
     __weak YTKACESABRSession *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{
+    [self perform:^{
         YTKACESABRSession *waiting = weakSelf;
         if (waiting == nil || waiting.finished) return;
-        YTKACEPreparePlayerWithRoute(waiting.videoID, YES, ^(id playerResponse, NSError *prepareError) {
+        YTKACEPreparePlayerWithRoute(waiting.videoID, YES, [waiting onQueue:
+            ^(id playerResponse, NSError *prepareError) {
             YTKACESABRSession *strongSelf = weakSelf;
             if (strongSelf == nil || strongSelf.finished) return;
             strongSelf.authRecoveryInFlight = NO;
@@ -1243,16 +1292,23 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
                 [NSURL URLWithString:strongSelf.serverURL].host,
                 (unsigned long)strongSelf.ustreamerConfig.length);
             [strongSelf sendRequest];
-        });
-    });
+        }]);
+    } after:wait];
 }
 
 - (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
  didReceiveResponse:(NSURLResponse *)response
   completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler {
     (void)session;
-    if (dataTask.taskDescription.integerValue == self.activeRequestNumber) {
+    if (dataTask.taskDescription.integerValue == self.activeRequestNumber &&
+        [response isKindOfClass:NSHTTPURLResponse.class]) {
         self.activeResponse = (NSHTTPURLResponse *)response;
+        long long expected = response.expectedContentLength;
+        if (expected > 0 && self.activeResponseData.length == 0) {
+            // Size the buffer once instead of growing it chunk by chunk.
+            self.activeResponseData = [NSMutableData dataWithCapacity:
+                (NSUInteger)MIN(expected, 64LL * 1024 * 1024)];
+        }
     }
     completionHandler(NSURLSessionResponseAllow);
 }
@@ -1308,8 +1364,12 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
  didCompleteWithError:(NSError *)error {
     (void)session;
     if (self.finished || task.taskDescription.integerValue != self.activeRequestNumber) return;
-    NSData *data = [self.activeResponseData copy];
-    NSHTTPURLResponse *http = self.activeResponse ?: (NSHTTPURLResponse *)task.response;
+    NSData *data = self.activeResponseData ?: [NSData data];
+    self.activeResponseData = nil;
+    NSHTTPURLResponse *http = self.activeResponse;
+    if (http == nil && [task.response isKindOfClass:NSHTTPURLResponse.class]) {
+        http = (NSHTTPURLResponse *)task.response;
+    }
     NSTimeInterval elapsed = MAX(NSDate.date.timeIntervalSinceReferenceDate -
         self.activeRequestStart, 0.001);
     double megabytesPerSecond = ((double)data.length / 1048576.0) / elapsed;
@@ -1323,17 +1383,22 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
             code:4];
         BOOL expired = http.statusCode == 401 || http.statusCode == 403 ||
             http.statusCode == 409 || http.statusCode == 410;
+        if (http.statusCode == 429 || http.statusCode == 503) {
+            id retryAfter = http.allHeaderFields[@"Retry-After"];
+            self.retryAfterSeconds = [retryAfter isKindOfClass:NSString.class]
+                ? MAX([retryAfter doubleValue], 0.0) : 0.0;
+        }
         if (expired && self.usingTVClient) {
             __weak YTKACESABRSession *weakSelf = self;
             NSString *reason = requestError.localizedDescription;
-            dispatch_async(dispatch_get_main_queue(), ^{
+            [self perform:^{
                 [weakSelf refreshTVClient:reason then:^(BOOL refreshed) {
                     YTKACESABRSession *strongSelf = weakSelf;
                     if (strongSelf == nil) return;
                     if (refreshed) [strongSelf sendRequest];
                     else [strongSelf retryOrFail:requestError];
                 }];
-            });
+            }];
         } else if (expired && YTKACEHasNativeOnesieSession(self.videoID)) {
             [self refreshNativeSession:requestError.localizedDescription];
         } else {
@@ -1354,11 +1419,12 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
         [self fail:error];
         return;
     }
-    NSTimeInterval delay = MIN(pow(2.0, self.retryCount - 1) * 0.5, 12.0);
+    NSTimeInterval delay = YTKACEDownloadRetryDelay(self.retryCount, 0.5, 12.0,
+        self.retryAfterSeconds);
+    self.retryAfterSeconds = 0.0;
     YTKACEDownloadLog(self.identifier, @"retry %ld delay=%.1f reason=%@",
         (long)self.retryCount, delay, error.localizedDescription);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ [self sendRequest]; });
+    [self perform:^{ [self sendRequest]; } after:delay];
 }
 
 - (void)handleInitialization:(NSData *)data {
@@ -1420,12 +1486,11 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
     if (header.headerID >= 0) self.headers[@(header.headerID)] = header;
 }
 
-- (void)handleMedia:(NSData *)data {
-    if (data.length < 1) return;
-    const uint8_t *bytes = (const uint8_t *)data.bytes;
+- (void)handleMediaBytes:(const uint8_t *)bytes length:(NSUInteger)length {
+    if (length < 1) return;
     YTKACESABRHeader *header = self.headers[@(bytes[0])];
-    if (header == nil || data.length == 1) return;
-    [header.data appendData:[data subdataWithRange:NSMakeRange(1, data.length - 1)]];
+    if (header == nil || length == 1) return;
+    [header.data appendBytes:bytes + 1 length:length - 1];
 }
 
 - (void)finishHeader:(NSData *)data {
@@ -1452,14 +1517,21 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
         return;
     }
     [track.segments addObject:segmentKey];
+    NSError *writeError = nil;
     if (header.initialization) {
         if (!track.initializationWritten) {
-            [track.handle writeData:header.data];
+            if (![track.handle writeData:header.data error:&writeError]) {
+                [self failWrite:writeError track:track];
+                return;
+            }
             track.initializationWritten = YES;
         }
         return;
     }
-    [track.handle writeData:header.data];
+    if (![track.handle writeData:header.data error:&writeError]) {
+        [self failWrite:writeError track:track];
+        return;
+    }
     track.downloadedBytes += (int64_t)header.data.length;
     track.lastSequence = MAX(track.lastSequence, header.sequence);
     track.downloadedDuration += MAX(header.duration, 0);
@@ -1471,6 +1543,12 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
     track.roundDuration += MAX(header.duration, 0);
     track.roundStartSequence = MIN(track.roundStartSequence, header.sequence);
     track.roundEndSequence = MAX(track.roundEndSequence, header.sequence);
+}
+
+- (void)failWrite:(NSError *)writeError track:(YTKACESABRTrack *)track {
+    YTKACEDownloadLog(self.identifier, @"write failed itag=%ld error=%@",
+        (long)track.option.itag, writeError.localizedDescription ?: @"unknown");
+    [self fail:YTKACEDownloadStorageError(writeError)];
 }
 
 - (void)handleRedirect:(NSData *)data {
@@ -1513,11 +1591,13 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
         ? (double)self.video.downloadedDuration / (double)self.video.endTime : 0.0;
     double audio = self.audio.endTime > 0
         ? (double)self.audio.downloadedDuration / (double)self.audio.endTime : 0.0;
-    if (self.progress != nil) {
+    YTKACESABRProgress progress = self.progress;
+    if (progress != nil) {
         audio = MIN(MAX(audio, 0.0), 1.0);
         video = MIN(MAX(video, 0.0), 1.0);
+        NSInteger phase = self.mediaPhase;
         dispatch_async(dispatch_get_main_queue(), ^{
-            self.progress(audio, video, audioBytes, videoBytes, self.mediaPhase);
+            progress(audio, video, audioBytes, videoBytes, phase);
         });
     }
 }
@@ -1550,18 +1630,26 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
             [self retryOrFail:[self error:@"YouTube returned an incomplete SABR response." code:5]];
             return;
         }
-        NSData *part = [response subdataWithRange:NSMakeRange(offset, size)];
+        NSUInteger partOffset = offset;
         offset += size;
         NSNumber *partType = @(type);
         partCounts[partType] = @([partCounts[partType] unsignedIntegerValue] + 1);
         partBytes[partType] = @([partBytes[partType] unsignedLongLongValue] + size);
+        if (type == 21) {
+            // Media is the bulk of the response: append it from the buffer without a copy.
+            [self handleMediaBytes:(const uint8_t *)response.bytes + partOffset length:size];
+            continue;
+        }
+        NSData *part = [response subdataWithRange:NSMakeRange(partOffset, size)];
         if (self.requestNumber <= 1 && (type == 46 || type == 51)) {
             YTKACEDownloadLog(self.identifier, @"directive type=%u data=%@", type,
                 [part base64EncodedStringWithOptions:0]);
         }
         if (type == 20) [self handleHeader:part];
-        else if (type == 21) [self handleMedia:part];
-        else if (type == 22) [self finishHeader:part];
+        else if (type == 22) {
+            [self finishHeader:part];
+            if (self.finished) return;
+        }
         else if (type == 35) [self handlePolicy:part];
         else if (type == 42) [self handleInitialization:part];
         else if (type == 43) [self handleRedirect:part];
@@ -1614,7 +1702,7 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
             }];
             return;
         }
-        YTKACEReloadPlayer(self.videoID, reloadToken,
+        YTKACEReloadPlayer(self.videoID, reloadToken, [self onQueue:
             ^(id playerResponse, NSError *error) {
             YTKACESABRSession *strongSelf = weakSelf;
             if (strongSelf == nil || strongSelf.finished) return;
@@ -1639,7 +1727,7 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
                 [NSURL URLWithString:strongSelf.serverURL].host,
                 (unsigned long)strongSelf.ustreamerConfig.length);
             [strongSelf sendRequest];
-            });
+            }]);
         return;
     }
     if (protectionStatus == 2 && [partCounts[@21] unsignedIntegerValue] == 0) {
@@ -1744,8 +1832,7 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
     }
     NSTimeInterval delay = MAX(self.backoffMilliseconds, 0) / 1000.0;
     self.backoffMilliseconds = 0;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ [self sendRequest]; });
+    [self perform:^{ [self sendRequest]; } after:delay];
 }
 
 - (BOOL)restartStalledSession:(NSString *)reason {
@@ -1764,8 +1851,7 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
         (long)self.stallRecoveryCount, (long)self.mediaPhase, reason ?: @"stalled",
         (double)self.audio.downloadedDuration, self.audio.endTime,
         (double)self.video.downloadedDuration, self.video.endTime);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ [self sendRequest]; });
+    [self perform:^{ [self sendRequest]; } after:delay];
     return YES;
 }
 
@@ -1785,9 +1871,7 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
         self.mediaPhase == 1 ? @"audio" : @"video", reason ?: @"unknown",
         self.audio.downloadedBytes, self.video.downloadedBytes);
     [self sendProgress];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        [self sendRequest];
-    });
+    [self perform:^{ [self sendRequest]; }];
     return YES;
 }
 
@@ -1799,22 +1883,30 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
                                code:8]];
         return;
     }
+    NSError *closeError = nil;
+    BOOL closed = [self.video.handle closeAndReturnError:&closeError];
+    closed = [self.audio.handle closeAndReturnError:closed ? &closeError : NULL] && closed;
+    if (!closed) {
+        [self fail:YTKACEDownloadStorageError(closeError)];
+        return;
+    }
     self.finished = YES;
-    [self.video.handle closeFile];
-    [self.audio.handle closeFile];
     [self.session invalidateAndCancel];
     YTKACEDownloadLog(self.identifier, @"SABR complete audio=%lld video=%lld",
         self.audio.downloadedBytes, self.video.downloadedBytes);
+    YTKACESABRCompletion completion = self.completion;
+    NSURL *videoURL = self.video.URL;
+    NSURL *audioURL = self.audio.URL;
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.completion(self.video.URL, self.audio.URL, nil);
+        completion(videoURL, audioURL, nil);
     });
 }
 
 - (void)fail:(NSError *)error {
     if (self.finished) return;
     self.finished = YES;
-    [self.video.handle closeFile];
-    [self.audio.handle closeFile];
+    [self.video.handle closeAndReturnError:nil];
+    [self.audio.handle closeAndReturnError:nil];
     [self.session invalidateAndCancel];
     YTKACEDownloadLog(self.identifier, @"SABR failed code=%ld error=%@",
         (long)error.code, error.localizedDescription);
@@ -1825,7 +1917,8 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
     if ([scratch.lastPathComponent hasPrefix:@"YTKACE-"]) {
         [NSFileManager.defaultManager removeItemAtURL:scratch error:nil];
     }
-    dispatch_async(dispatch_get_main_queue(), ^{ self.completion(nil, nil, error); });
+    YTKACESABRCompletion completion = self.completion;
+    dispatch_async(dispatch_get_main_queue(), ^{ completion(nil, nil, error); });
 }
 
 - (void)cancel {
@@ -1874,8 +1967,15 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
     session.identifier = identifier;
     session.progress = progress;
     session.completion = completion;
+    session.queue = dispatch_queue_create("YTKACE.SABR.session",
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    // UIKit-backed client info is gathered here (main thread) rather than on the session queue.
+    if (NSThread.isMainThread) session.clientInfo = YTKACESABRClientInfo();
     __weak YTKACESABRSession *weakSession = session;
-    task.cancelBlock = ^{ [weakSession cancel]; };
+    task.cancelBlock = ^{
+        YTKACESABRSession *strongSession = weakSession;
+        [strongSession perform:^{ [strongSession cancel]; }];
+    };
     objc_setAssociatedObject(session, @selector(start), session, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     YTKACESABRCompletion original = [completion copy];
     __weak YTKACESABRTask *weakTask = task;
@@ -1887,7 +1987,7 @@ NSUInteger YTKACEPurgeDownloadScratch(BOOL includeActive) {
         objc_setAssociatedObject(strongSession, @selector(start), nil,
             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     };
-    [session start];
+    [session perform:^{ [session start]; }];
     return task;
 }
 
