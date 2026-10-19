@@ -6,7 +6,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -14,7 +18,9 @@ jobs:
 
   publish:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
 
@@ -31,17 +37,28 @@ jobs:
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" fresh/*.deb --clobber
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" fresh/*.deb --clobber
 
       - name: Collect every published package
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           mkdir -p site/debs
-          cp fresh/*.deb site/debs/ 2>/dev/null || true
-          for tag in $(gh release list --limit 100 --json tagName -q '.[].tagName'); do
-            gh release download "$tag" --pattern '*.deb' --dir site/debs --clobber || true
-          done
+          cp fresh/*.deb site/debs/
+          tags="$(gh release list --limit 100 --json tagName -q '.[].tagName')"
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            # Releases without .deb assets are expected; any other failure
+            # (network, auth, missing release) must fail the job.
+            assets="$(gh release view "$tag" --json assets -q '.assets[].name')"
+            if grep -q '\.deb$' <<<"$assets"; then
+              gh release download "$tag" --pattern '*.deb' --dir site/debs --clobber
+            else
+              echo "No .deb assets in $tag; skipping."
+            fi
+          done <<<"$tags"
           ls -la site/debs
 
       - name: Build index
@@ -85,7 +102,7 @@ jobs:
           icon=$(find Resources -iname 'CydiaIcon.png' -o -iname 'icon*.png' | head -1)
           if [[ -n "$icon" ]]; then cp "$icon" site/CydiaIcon.png; fi
 
-      - uses: peaceiris/actions-gh-pages@v4
+      - uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4.1.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./site
