@@ -544,17 +544,37 @@ static void YTKACEDidActivateVideo(id receiver,
     }];
 }
 
+// The second argument of singleVideo:currentVideoTimeDidChange: is a
+// YTSingleVideoTime object, not a double. Declaring it as double made these
+// hooks forward whatever was left in the object register to YouTube's own
+// implementation, which crashed playback at random. Read the seconds from the
+// object instead, checking the getter really returns a floating-point value.
+static double YTKACESecondsFromTimeObject(id timeObject) {
+    if (timeObject == nil) return 0.0;
+    if ([timeObject isKindOfClass:NSNumber.class]) return [timeObject doubleValue];
+    for (NSString *selectorName in @[@"time", @"seconds", @"currentTime"]) {
+        SEL selector = NSSelectorFromString(selectorName);
+        if (![timeObject respondsToSelector:selector]) continue;
+        NSMethodSignature *signature = [timeObject methodSignatureForSelector:selector];
+        const char *type = signature.methodReturnType;
+        if (type == NULL) continue;
+        if (type[0] == 'd') return ((double (*)(id, SEL))objc_msgSend)(timeObject, selector);
+        if (type[0] == 'f') return ((float (*)(id, SEL))objc_msgSend)(timeObject, selector);
+    }
+    return 0.0;
+}
+
 static void YTKACESingleVideoTimeChanged(id receiver,
                                          SEL selector,
                                          id video,
-                                         double time) {
+                                         id timeObject) {
     if (OriginalSingleVideoTimeChanged != NULL) {
-        ((void (*)(id, SEL, id, double))OriginalSingleVideoTimeChanged)(
-            receiver, selector, video, time
+        ((void (*)(id, SEL, id, id))OriginalSingleVideoTimeChanged)(
+            receiver, selector, video, timeObject
         );
     }
     double current = YTKACEDoubleMessage(receiver, @[@"currentVideoMediaTime"]);
-    double resolved = current > 0.0 ? current : time;
+    double resolved = current > 0.0 ? current : YTKACESecondsFromTimeObject(timeObject);
     if (YTKACESponsorTimeUpdatesEnabled) {
         YTKACEEvaluateSponsorTime(receiver, resolved);
     }
@@ -564,14 +584,14 @@ static void YTKACESingleVideoTimeChanged(id receiver,
 static void YTKACEMutatedVideoTimeChanged(id receiver,
                                           SEL selector,
                                           id video,
-                                          double time) {
+                                          id timeObject) {
     if (OriginalMutatedVideoTimeChanged != NULL) {
-        ((void (*)(id, SEL, id, double))OriginalMutatedVideoTimeChanged)(
-            receiver, selector, video, time
+        ((void (*)(id, SEL, id, id))OriginalMutatedVideoTimeChanged)(
+            receiver, selector, video, timeObject
         );
     }
     double current = YTKACEDoubleMessage(receiver, @[@"currentVideoMediaTime"]);
-    double resolved = current > 0.0 ? current : time;
+    double resolved = current > 0.0 ? current : YTKACESecondsFromTimeObject(timeObject);
     if (YTKACESponsorTimeUpdatesEnabled) {
         YTKACEEvaluateSponsorTime(receiver, resolved);
     }
