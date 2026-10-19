@@ -103,6 +103,6 @@ void YTKACERefreshSponsorSegments(
         completion:^(NSArray<NSDictionary<NSString *, id> *> *segments) {
             if (segments.count == 0) return;
             YTKACEWriteSponsorRecord(target, videoID, author, segments);
-            completion(YTKACEValidSegments(segments));
+            if (completion != nil) completion(YTKACEValidSegments(segments));
         }];
 }
